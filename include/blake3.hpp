@@ -342,29 +342,25 @@ hash(sycl::queue& q,
      const sycl::uchar* const __restrict input,
      const size_t i_size, // bytes
      const size_t chunk_count,
-     const size_t wg_size,
      sycl::uchar* const __restrict digest)
 {
   assert(i_size == chunk_count * CHUNK_LEN);
   assert(chunk_count >= 2); // but you would probably want >= 2^20
   assert((chunk_count & (chunk_count - 1)) == 0); // ensure power of 2
-  assert(wg_size <= chunk_count);
 
   const size_t mem_size = static_cast<size_t>(BLOCK_LEN) * chunk_count;
   sycl::uint* mem = static_cast<sycl::uint*>(sycl::malloc_device(mem_size, q));
   const size_t mem_offset = (OUT_LEN >> 2) * chunk_count;
 
-  sycl::event evt_0 = q.parallel_for<class kernelBlake3HashChunkifyLeafNodes>(
-    sycl::nd_range<1>{ sycl::range<1>{ chunk_count },
-                       sycl::range<1>{ wg_size } },
-    [=](sycl::nd_item<1> it) {
-      const size_t idx = it.get_global_linear_id();
-
-      chunkify(IV,
-               static_cast<sycl::ulong>(idx),
-               0,
-               input + idx * CHUNK_LEN,
-               mem + mem_offset + idx * (OUT_LEN >> 2));
+  sycl::event evt_0 =
+    q.single_task<class kernelBlake3HashChunkifyLeafNodes>([=]() {
+      for (size_t i = 0; i < chunk_count; i++) {
+        chunkify(IV,
+                 static_cast<sycl::ulong>(i),
+                 0,
+                 input + i * CHUNK_LEN,
+                 mem + mem_offset + i * (OUT_LEN >> 2));
+      }
     });
 
   const size_t rounds =
@@ -402,21 +398,16 @@ hash(sycl::queue& q,
       const size_t read_offset = mem_offset >> r;
       const size_t write_offset = read_offset >> 1;
       const size_t glb_work_items = chunk_count >> (r + 1);
-      const size_t loc_work_items =
-        glb_work_items < wg_size ? glb_work_items : wg_size;
 
-      h.parallel_for<class kernelBlake3HashParentChaining>(
-        sycl::nd_range<1>{ sycl::range<1>{ glb_work_items },
-                           sycl::range<1>{ loc_work_items } },
-        [=](sycl::nd_item<1> it) {
-          const size_t idx = it.get_global_linear_id();
-
-          parent_cv(mem + read_offset + (idx << 1) * (OUT_LEN >> 2),
-                    mem + read_offset + ((idx << 1) + 1) * (OUT_LEN >> 2),
+      h.single_task<class kernelBlake3HashParentChaining>([=]() {
+        for (size_t i = 0; i < glb_work_items; i++) {
+          parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
+                    mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
                     IV,
                     0,
-                    mem + write_offset + idx * (OUT_LEN >> 2));
-        });
+                    mem + write_offset + i * (OUT_LEN >> 2));
+        }
+      });
     });
     evts.push_back(evt);
   }

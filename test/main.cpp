@@ -1,10 +1,21 @@
 #include "blake3.hpp"
 #include <iostream>
+#include <sycl/ext/intel/fpga_extensions.hpp>
+
+#if !(defined FPGA_EMU || defined FPGA_HW)
+#define FPGA_EMU
+#endif
 
 int
 main(int argc, char** argv)
 {
-  sycl::default_selector s{};
+
+#if defined FPGA_EMU
+  sycl::ext::intel::fpga_emulator_selector s{};
+#elif defined FPGA_HW
+  sycl::ext::intel::fpga_selector s{};
+#endif
+
   sycl::device d{ s };
   sycl::context c{ d };
   sycl::queue q{ c, d };
@@ -14,7 +25,6 @@ main(int argc, char** argv)
             << std::endl;
 
   constexpr size_t chunk_count = 1 << 10;
-  constexpr size_t wg_size = 1 << 6;
 
   // in bash console
   //
@@ -45,7 +55,7 @@ main(int argc, char** argv)
   // host to device input data tx
   q.memcpy(i_d, i_h, i_size).wait();
   // compute on accelerator, wait until completed
-  blake3::hash(q, i_d, i_size, chunk_count, wg_size, o_d);
+  blake3::hash(q, i_d, i_size, chunk_count, o_d);
   // device to host digest tx
   q.memcpy(o_h, o_d, blake3::OUT_LEN).wait();
 
