@@ -247,43 +247,37 @@ chunkify(const sycl::uint* const __restrict key_words,
     in_cv[i] = key_words[i];
   }
 
-  // all message blocks to be consumed sequentially ( in-order )
-  for (size_t i = 0; i < 16; i++) {
-    // prepare sixteen input message words before mixing
-    words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
+  // --- begin processing first message block ---
+  words_from_le_bytes(input, msg_words);
+  compress(in_cv,
+           msg_words,
+           chunk_counter,
+           BLOCK_LEN,
+           flags | CHUNK_START,
+           priv_out_cv);
 
-    switch (i) {
-      case 0:
-        // left most message block of chunk
-        compress(in_cv,
-                 msg_words,
-                 chunk_counter,
-                 BLOCK_LEN,
-                 flags | CHUNK_START,
-                 priv_out_cv);
-        break;
-      case 15:
-        // right most message block of chunk
-        compress(in_cv,
-                 msg_words,
-                 chunk_counter,
-                 BLOCK_LEN,
-                 flags | CHUNK_END,
-                 out_cv);
-        break;
-      default:
-        // any of 14 remaining middle message blocks of chunk
-        compress(
-          in_cv, msg_words, chunk_counter, BLOCK_LEN, flags, priv_out_cv);
-    }
-
-    if (i < 15) {
 #pragma unroll 8 // copying between array can be fully parallelized !
-      for (size_t j = 0; j < 8; j++) {
-        in_cv[j] = priv_out_cv[j];
-      }
+  for (size_t j = 0; j < 8; j++) {
+    in_cv[j] = priv_out_cv[j];
+  }
+  // --- end processing first message block ---
+
+  // process intermediate ( read non-boundary ) 14 message blocks
+  for (size_t i = 1; i < 15; i++) {
+    words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
+    compress(in_cv, msg_words, chunk_counter, BLOCK_LEN, flags, priv_out_cv);
+
+#pragma unroll 8 // copying between array can be fully parallelized !
+    for (size_t j = 0; j < 8; j++) {
+      in_cv[j] = priv_out_cv[j];
     }
   }
+
+  // --- begin processing last message block ---
+  words_from_le_bytes(input + 15 * BLOCK_LEN, msg_words);
+  compress(
+    in_cv, msg_words, chunk_counter, BLOCK_LEN, flags | CHUNK_END, out_cv);
+  // --- end processing last message block ---
 }
 
 // Computes chaining value for some parent ( intermediate, but non-root ) node
