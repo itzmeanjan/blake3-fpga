@@ -284,7 +284,6 @@ chunkify(const sycl::uint* const __restrict key_words,
   // --- end processing first message block ---
 
   // process intermediate ( read non-boundary ) 14 message blocks
-  [[intel::ivdep]]
   for (size_t i = 1; i < 15; i++)
   {
     words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
