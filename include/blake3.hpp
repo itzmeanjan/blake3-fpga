@@ -1,6 +1,7 @@
 #pragma once
 #define SYCL_SIMPLE_SWIZZLES 1
 #include <CL/sycl.hpp>
+#include <cassert>
 
 namespace blake3 {
 
@@ -201,6 +202,28 @@ words_from_le_bytes(const sycl::uchar* const __restrict input,
   }
 }
 
+// One 32 -bit BLAKE3 word is converted to four consecutive little endian bytes
+static inline void
+word_to_le_bytes(const sycl::uint word, sycl::uchar* const output)
+{
+  output[0] = static_cast<sycl::uchar>(word & 0xff);
+  output[1] = static_cast<sycl::uchar>((word >> 8) & 0xff);
+  output[2] = static_cast<sycl::uchar>((word >> 16) & 0xff);
+  output[3] = static_cast<sycl::uchar>((word >> 24) & 0xff);
+}
+
+// Eight consecutive BLAKE3 message words are converted to 32 little endian
+// bytes
+static inline void
+words_to_le_bytes(const sycl::uint* const __restrict msg_words,
+                  sycl::uchar* const __restrict output)
+{
+#pragma unroll 8
+  for (size_t i = 0; i < 8; i++) {
+    word_to_le_bytes(msg_words[i], output + (i << 2));
+  }
+}
+
 // Sequentially compresses all sixteen message blocks present in a 1024
 // -bytes wide BLAKE3 chunk and produces 32 -bytes output chaining value
 // of this chunk, which will be used for computing parent nodes of BLAKE3
@@ -305,6 +328,112 @@ root_cv(const sycl::uint* const __restrict left_cv,
         sycl::uint* const __restrict out_cv)
 {
   parent_cv(left_cv, right_cv, key_words, ROOT, out_cv);
+}
+
+// BLAKE3 hash function, can be used when chunk count is power of 2
+//
+// Note, chunk count is preferred to be relatively large number ( say >= 2^20 )
+// because this function is supposed to be executed on accelerator
+//
+// See
+// https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1876-L2006
+void
+hash(sycl::queue& q,
+     const sycl::uchar* const __restrict input,
+     const size_t i_size, // bytes
+     const size_t chunk_count,
+     const size_t wg_size,
+     sycl::uchar* const __restrict digest)
+{
+  assert(i_size == chunk_count * CHUNK_LEN);
+  assert(chunk_count >= 2); // but you would probably want >= 2^20
+  assert((chunk_count & (chunk_count - 1)) == 0); // ensure power of 2
+  assert(wg_size <= chunk_count);
+
+  const size_t mem_size = static_cast<size_t>(BLOCK_LEN) * chunk_count;
+  sycl::uint* mem = static_cast<sycl::uint*>(sycl::malloc_device(mem_size, q));
+  const size_t mem_offset = (OUT_LEN >> 2) * chunk_count;
+
+  sycl::event evt_0 = q.parallel_for<class kernelBlake3HashChunkifyLeafNodes>(
+    sycl::nd_range<1>{ sycl::range<1>{ chunk_count },
+                       sycl::range<1>{ wg_size } },
+    [=](sycl::nd_item<1> it) {
+      const size_t idx = it.get_global_linear_id();
+
+      chunkify(IV,
+               static_cast<sycl::ulong>(idx),
+               0,
+               input + idx * CHUNK_LEN,
+               mem + mem_offset + idx * (OUT_LEN >> 2));
+    });
+
+  const size_t rounds =
+    static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
+
+  if (rounds == 0) {
+    sycl::event evt_1 = q.submit([&](sycl::handler& h) {
+      h.depends_on(evt_0);
+      h.single_task<class kernelBlake3HashRootChaining0>([=]() {
+        root_cv(mem + mem_offset + 0 * (OUT_LEN >> 2),
+                mem + mem_offset + 1 * (OUT_LEN >> 2),
+                IV,
+                mem + 1 * (OUT_LEN >> 2));
+        words_to_le_bytes(mem + 1 * (OUT_LEN >> 2), digest);
+      });
+    });
+
+    evt_1.wait();
+    sycl::free(mem, q);
+
+    return;
+  }
+
+  std::vector<sycl::event> evts;
+  evts.reserve(rounds);
+
+  for (size_t r = 0; r < rounds; r++) {
+    sycl::event evt = q.submit([&](sycl::handler& h) {
+      if (r == 0) {
+        h.depends_on(evt_0);
+      } else {
+        h.depends_on(evts.at(r - 1));
+      }
+
+      const size_t read_offset = mem_offset >> r;
+      const size_t write_offset = read_offset >> 1;
+      const size_t glb_work_items = chunk_count >> (r + 1);
+      const size_t loc_work_items =
+        glb_work_items < wg_size ? glb_work_items : wg_size;
+
+      h.parallel_for<class kernelBlake3HashParentChaining>(
+        sycl::nd_range<1>{ sycl::range<1>{ glb_work_items },
+                           sycl::range<1>{ loc_work_items } },
+        [=](sycl::nd_item<1> it) {
+          const size_t idx = it.get_global_linear_id();
+
+          parent_cv(mem + read_offset + (idx << 1) * (OUT_LEN >> 2),
+                    mem + read_offset + ((idx << 1) + 1) * (OUT_LEN >> 2),
+                    IV,
+                    0,
+                    mem + write_offset + idx * (OUT_LEN >> 2));
+        });
+    });
+    evts.push_back(evt);
+  }
+
+  sycl::event evt_1 = q.submit([&](sycl::handler& h) {
+    h.depends_on(evts.at(rounds - 1));
+    h.single_task<class kernelBlake3HashRootChaining1>([=]() {
+      root_cv(mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
+              mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2),
+              IV,
+              mem + 1 * (OUT_LEN >> 2));
+      words_to_le_bytes(mem + 1 * (OUT_LEN >> 2), digest);
+    });
+  });
+
+  evt_1.wait();
+  sycl::free(mem, q);
 }
 
 }
