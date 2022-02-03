@@ -117,7 +117,7 @@ permute(sycl::uint* const msg_words)
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1641-L1703
 inline void
 compress(const sycl::uint* in_cv,
-         sycl::uint* const block_words,
+         sycl::uint* const msg_words,
          const sycl::ulong counter,
          const sycl::uint block_len,
          const sycl::uint flags,
@@ -133,31 +133,31 @@ compress(const sycl::uint* in_cv,
                              flags) };
 
   // round 1
-  rnd(state, block_words);
-  permute(block_words);
+  rnd(state, msg_words);
+  permute(msg_words);
 
   // round 2
-  rnd(state, block_words);
-  permute(block_words);
+  rnd(state, msg_words);
+  permute(msg_words);
 
   // round 3
-  rnd(state, block_words);
-  permute(block_words);
+  rnd(state, msg_words);
+  permute(msg_words);
 
   // round 4
-  rnd(state, block_words);
-  permute(block_words);
+  rnd(state, msg_words);
+  permute(msg_words);
 
   // round 5
-  rnd(state, block_words);
-  permute(block_words);
+  rnd(state, msg_words);
+  permute(msg_words);
 
   // round 6
-  rnd(state, block_words);
-  permute(block_words);
+  rnd(state, msg_words);
+  permute(msg_words);
 
   // round 7
-  rnd(state, block_words);
+  rnd(state, msg_words);
   // no need to permute message words anymore !
 
   state[0] ^= state[2];
@@ -175,6 +175,91 @@ compress(const sycl::uint* in_cv,
     auto priv_out_cv = sycl::private_ptr<sycl::uint>(out_cv);
     state[0].store(0, priv_out_cv);
     state[1].store(1, priv_out_cv);
+  }
+}
+
+// Four consecutive little endian bytes are interpreted as 32 -bit unsigned
+// integer i.e. BLAKE3 message word
+static inline const sycl::uint
+word_from_le_bytes(const sycl::uchar* const input)
+{
+  return static_cast<sycl::uint>(input[3]) << 24 |
+         static_cast<sycl::uint>(input[2]) << 16 |
+         static_cast<sycl::uint>(input[1]) << 8 |
+         static_cast<sycl::uint>(input[0]) << 0;
+}
+
+// 64 little endian input bytes of a message block to be interpreted as sixteen
+// BLAKE3 words ( = uint32_t each )
+static inline void
+words_from_le_bytes(const sycl::uchar* const __restrict input,
+                    sycl::uint* const __restrict msg_words)
+{
+#pragma unroll 16
+  for (size_t i = 0; i < 16; i++) {
+    msg_words[i] = word_from_le_bytes(input + (i << 2));
+  }
+}
+
+// Sequentially compresses all sixteen message blocks present in a 1024
+// -bytes wide BLAKE3 chunk and produces 32 -bytes output chaining value
+// of this chunk, which will be used for computing parent nodes of BLAKE3
+// merkle tree
+//
+// See
+// https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1790-L1842
+void
+chunkify(const sycl::uint* const __restrict key_words,
+         const sycl::ulong chunk_counter,
+         const sycl::uint flags,
+         const sycl::uchar* const __restrict input,
+         sycl::uint* const __restrict out_cv)
+{
+  sycl::uint in_cv[8];
+  sycl::uint priv_out_cv[8];
+  sycl::uint msg_words[16];
+
+#pragma unroll 8 // attempt to fully parallelize array initialization !
+  for (size_t i = 0; i < 8; i++) {
+    in_cv[i] = key_words[i];
+  }
+
+  // all message blocks to be consumed sequentially ( in-order )
+  for (size_t i = 0; i < 16; i++) {
+    // prepare sixteen input message words before mixing
+    words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
+
+    switch (i) {
+      case 0:
+        // left most message block of chunk
+        compress(in_cv,
+                 msg_words,
+                 chunk_counter,
+                 BLOCK_LEN,
+                 flags | CHUNK_START,
+                 priv_out_cv);
+        break;
+      case 15:
+        // right most message block of chunk
+        compress(in_cv,
+                 msg_words,
+                 chunk_counter,
+                 BLOCK_LEN,
+                 flags | CHUNK_END,
+                 out_cv);
+        break;
+      default:
+        // any of 14 remaining middle message blocks of chunk
+        compress(
+          in_cv, msg_words, chunk_counter, BLOCK_LEN, flags, priv_out_cv);
+    }
+
+    if (i < 15) {
+#pragma unroll 8 // copying between array can be fully parallelized !
+      for (size_t j = 0; j < 8; j++) {
+        in_cv[j] = priv_out_cv[j];
+      }
+    }
   }
 }
 
