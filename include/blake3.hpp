@@ -42,15 +42,23 @@ constexpr sycl::uint ROOT = 1 << 3;
 inline void
 rnd(sycl::uint4* const state, const sycl::uint* msg)
 {
-  const sycl::uint4 mx = sycl::uint4(msg[0], msg[2], msg[4], msg[6]);
-  const sycl::uint4 my = sycl::uint4(msg[1], msg[3], msg[5], msg[7]);
-  const sycl::uint4 mz = sycl::uint4(msg[8], msg[10], msg[12], msg[14]);
-  const sycl::uint4 mw = sycl::uint4(msg[9], msg[11], msg[13], msg[15]);
+  [[intel::fpga_memory]] const sycl::uint4 mx =
+    sycl::uint4(msg[0], msg[2], msg[4], msg[6]);
+  [[intel::fpga_memory]] const sycl::uint4 my =
+    sycl::uint4(msg[1], msg[3], msg[5], msg[7]);
+  [[intel::fpga_memory]] const sycl::uint4 mz =
+    sycl::uint4(msg[8], msg[10], msg[12], msg[14]);
+  [[intel::fpga_memory]] const sycl::uint4 mw =
+    sycl::uint4(msg[9], msg[11], msg[13], msg[15]);
 
-  constexpr sycl::uint4 rrot_16 = sycl::uint4(16); // = 32 - 16
-  constexpr sycl::uint4 rrot_12 = sycl::uint4(20); // = 32 - 12
-  constexpr sycl::uint4 rrot_8 = sycl::uint4(24);  // = 32 - 8
-  constexpr sycl::uint4 rrot_7 = sycl::uint4(25);  // = 32 - 7
+  [[intel::fpga_memory]] constexpr sycl::uint4 rrot_16 =
+    sycl::uint4(16); // = 32 - 16
+  [[intel::fpga_memory]] constexpr sycl::uint4 rrot_12 =
+    sycl::uint4(20); // = 32 - 12
+  [[intel::fpga_memory]] constexpr sycl::uint4 rrot_8 =
+    sycl::uint4(24); // = 32 - 8
+  [[intel::fpga_memory]] constexpr sycl::uint4 rrot_7 =
+    sycl::uint4(25); // = 32 - 7
 
   // column-wise mixing
   state[0] = state[0] + state[1] + mx;
@@ -97,15 +105,19 @@ permute(sycl::uint* const msg_words)
 {
   // additional array memory ( = 64 -bytes ) for helping in message word
   // permutation
-  sycl::uint permuted[16];
+  [[intel::fpga_memory]] sycl::uint permuted[16];
 
 #pragma unroll 16 // fully unroll this loop
-  for (size_t i = 0; i < 16; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 16; i++)
+  {
     permuted[i] = msg_words[MSG_PERMUTATION[i]];
   }
 
 #pragma unroll 16 // fully unroll this loop
-  for (size_t i = 0; i < 16; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 16; i++)
+  {
     msg_words[i] = permuted[i];
   }
 }
@@ -124,14 +136,15 @@ compress(const sycl::uint* in_cv,
          const sycl::uint flags,
          sycl::uint* const out_cv)
 {
-  sycl::uint4 state[4] = { sycl::uint4(in_cv[0], in_cv[1], in_cv[2], in_cv[3]),
-                           sycl::uint4(in_cv[4], in_cv[5], in_cv[6], in_cv[7]),
-                           sycl::uint4(IV[0], IV[1], IV[2], IV[3]),
-                           sycl::uint4(
-                             static_cast<sycl::uint>(counter & 0xffffffff),
-                             static_cast<sycl::uint>(counter >> 32),
-                             block_len,
-                             flags) };
+  [[intel::fpga_memory]] sycl::uint4 state[4] = {
+    sycl::uint4(in_cv[0], in_cv[1], in_cv[2], in_cv[3]),
+    sycl::uint4(in_cv[4], in_cv[5], in_cv[6], in_cv[7]),
+    sycl::uint4(IV[0], IV[1], IV[2], IV[3]),
+    sycl::uint4(static_cast<sycl::uint>(counter & 0xffffffff),
+                static_cast<sycl::uint>(counter >> 32),
+                block_len,
+                flags)
+  };
 
   // round 1
   rnd(state, msg_words);
@@ -197,7 +210,9 @@ words_from_le_bytes(const sycl::uchar* const __restrict input,
                     sycl::uint* const __restrict msg_words)
 {
 #pragma unroll 16
-  for (size_t i = 0; i < 16; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 16; i++)
+  {
     msg_words[i] = word_from_le_bytes(input + (i << 2));
   }
 }
@@ -219,7 +234,9 @@ words_to_le_bytes(const sycl::uint* const __restrict msg_words,
                   sycl::uchar* const __restrict output)
 {
 #pragma unroll 8
-  for (size_t i = 0; i < 8; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 8; i++)
+  {
     word_to_le_bytes(msg_words[i], output + (i << 2));
   }
 }
@@ -238,12 +255,14 @@ chunkify(const sycl::uint* const __restrict key_words,
          const sycl::uchar* const __restrict input,
          sycl::uint* const __restrict out_cv)
 {
-  sycl::uint in_cv[8];
-  sycl::uint priv_out_cv[8];
-  sycl::uint msg_words[16];
+  [[intel::fpga_memory]] sycl::uint in_cv[8];
+  [[intel::fpga_memory]] sycl::uint priv_out_cv[8];
+  [[intel::fpga_memory]] sycl::uint msg_words[16];
 
 #pragma unroll 8 // attempt to fully parallelize array initialization !
-  for (size_t i = 0; i < 8; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 8; i++)
+  {
     in_cv[i] = key_words[i];
   }
 
@@ -257,18 +276,24 @@ chunkify(const sycl::uint* const __restrict key_words,
            priv_out_cv);
 
 #pragma unroll 8 // copying between array can be fully parallelized !
-  for (size_t j = 0; j < 8; j++) {
+  [[intel::ivdep]]
+  for (size_t j = 0; j < 8; j++)
+  {
     in_cv[j] = priv_out_cv[j];
   }
   // --- end processing first message block ---
 
   // process intermediate ( read non-boundary ) 14 message blocks
-  for (size_t i = 1; i < 15; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 1; i < 15; i++)
+  {
     words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
     compress(in_cv, msg_words, chunk_counter, BLOCK_LEN, flags, priv_out_cv);
 
 #pragma unroll 8 // copying between array can be fully parallelized !
-    for (size_t j = 0; j < 8; j++) {
+    [[intel::ivdep]]
+    for (size_t j = 0; j < 8; j++)
+    {
       in_cv[j] = priv_out_cv[j];
     }
   }
@@ -292,15 +317,18 @@ parent_cv(const sycl::uint* const __restrict left_cv,
           const sycl::uint flags,
           sycl::uint* const __restrict out_cv)
 {
-  sycl::uint block_words[16];
+  [[intel::fpga_memory]] sycl::uint block_words[16];
 
 #pragma unroll 8
-  for (size_t i = 0; i < 8; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 8; i++)
+  {
     block_words[i] = left_cv[i];
   }
-
 #pragma unroll 8
-  for (size_t i = 0; i < 8; i++) {
+  [[intel::ivdep]]
+  for (size_t i = 0; i < 8; i++)
+  {
     block_words[i + 8] = right_cv[i];
   }
 
@@ -339,44 +367,29 @@ hash(sycl::queue& q,
      sycl::uchar* const __restrict digest)
 {
   assert(i_size == chunk_count * CHUNK_LEN);
-  assert(chunk_count >= 2); // but you would probably want >= 2^20
+  // minimum 1MB input size for this implementation
+  assert(chunk_count >= (1 << 10)); // but you would probably want >= 2^20
   assert((chunk_count & (chunk_count - 1)) == 0); // ensure power of 2
 
   const size_t mem_size = static_cast<size_t>(BLOCK_LEN) * chunk_count;
   sycl::uint* mem = static_cast<sycl::uint*>(sycl::malloc_device(mem_size, q));
   const size_t mem_offset = (OUT_LEN >> 2) * chunk_count;
 
-  sycl::event evt_0 =
-    q.single_task<class kernelBlake3HashChunkifyLeafNodes>([=]() {
-      for (size_t i = 0; i < chunk_count; i++) {
-        chunkify(IV,
-                 static_cast<sycl::ulong>(i),
-                 0,
-                 input + i * CHUNK_LEN,
-                 mem + mem_offset + i * (OUT_LEN >> 2));
-      }
-    });
+  sycl::event evt_0 = q.single_task<class kernelBlake3HashChunkifyLeafNodes>([=
+  ]() [[intel::kernel_args_restrict]] {
+    [[intel::ivdep]]
+    for (size_t i = 0; i < chunk_count; i++)
+    {
+      chunkify(IV,
+               static_cast<sycl::ulong>(i),
+               0,
+               input + i * CHUNK_LEN,
+               mem + mem_offset + i * (OUT_LEN >> 2));
+    }
+  });
 
   const size_t rounds =
     static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
-
-  if (rounds == 0) {
-    sycl::event evt_1 = q.submit([&](sycl::handler& h) {
-      h.depends_on(evt_0);
-      h.single_task<class kernelBlake3HashRootChaining0>([=]() {
-        root_cv(mem + mem_offset + 0 * (OUT_LEN >> 2),
-                mem + mem_offset + 1 * (OUT_LEN >> 2),
-                IV,
-                mem + 1 * (OUT_LEN >> 2));
-        words_to_le_bytes(mem + 1 * (OUT_LEN >> 2), digest);
-      });
-    });
-
-    evt_1.wait();
-    sycl::free(mem, q);
-
-    return;
-  }
 
   std::vector<sycl::event> evts;
   evts.reserve(rounds);
@@ -393,8 +406,11 @@ hash(sycl::queue& q,
       const size_t write_offset = read_offset >> 1;
       const size_t glb_work_items = chunk_count >> (r + 1);
 
-      h.single_task<class kernelBlake3HashParentChaining>([=]() {
-        for (size_t i = 0; i < glb_work_items; i++) {
+      h.single_task<class kernelBlake3HashParentChaining>([=
+      ]() [[intel::kernel_args_restrict]] {
+        [[intel::ivdep]]
+        for (size_t i = 0; i < glb_work_items; i++)
+        {
           parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
                     mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
                     IV,
@@ -408,7 +424,8 @@ hash(sycl::queue& q,
 
   sycl::event evt_1 = q.submit([&](sycl::handler& h) {
     h.depends_on(evts.at(rounds - 1));
-    h.single_task<class kernelBlake3HashRootChaining1>([=]() {
+    h.single_task<class kernelBlake3HashRootChaining>([=
+    ]() [[intel::kernel_args_restrict]] {
       root_cv(mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
               mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2),
               IV,
