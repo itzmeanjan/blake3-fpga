@@ -226,10 +226,11 @@ words_from_le_bytes(const sycl::uchar* const __restrict input,
 static inline void
 word_to_le_bytes(const sycl::uint word, sycl::uchar* const output)
 {
-  output[0] = static_cast<sycl::uchar>(word & 0xff);
-  output[1] = static_cast<sycl::uchar>((word >> 8) & 0xff);
-  output[2] = static_cast<sycl::uchar>((word >> 16) & 0xff);
-  output[3] = static_cast<sycl::uchar>((word >> 24) & 0xff);
+ #pragma unroll 4
+  [[intel::ivdep]]
+  for(size_t i = 0; i < 4; i++) {
+    output[i] = static_cast<sycl::uchar>((word >> (i << 3)) & 0xff);
+  }
 }
 
 // Eight consecutive BLAKE3 message words are converted to 32 little endian
