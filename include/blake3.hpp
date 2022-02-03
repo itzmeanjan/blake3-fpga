@@ -263,4 +263,48 @@ chunkify(const sycl::uint* const __restrict key_words,
   }
 }
 
+// Computes chaining value for some parent ( intermediate, but non-root ) node
+// of BLAKE3 merkle tree, by compressing sixteen input message words
+//
+// See
+// https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1844-L1865
+static inline void
+parent_cv(const sycl::uint* const __restrict left_cv,
+          const sycl::uint* const __restrict right_cv,
+          const sycl::uint* const __restrict key_words,
+          const sycl::uint flags,
+          sycl::uint* const __restrict out_cv)
+{
+  sycl::uint block_words[16];
+
+#pragma unroll 8
+  for (size_t i = 0; i < 8; i++) {
+    block_words[i] = left_cv[i];
+  }
+
+#pragma unroll 8
+  for (size_t i = 0; i < 8; i++) {
+    block_words[i + 8] = right_cv[i];
+  }
+
+  compress(key_words, block_words, 0, BLOCK_LEN, flags | PARENT, out_cv);
+}
+
+// Computes BLAKE3 merkle tree's root chaining value ( 32 -bytes ) by
+// compressing two immediate children node's chaining values ( each chaining
+// value 32 -bytes )
+//
+// Note this chaining value is nothing but BLAKE3 digest
+//
+// See
+// https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1867-L1874
+static inline void
+root_cv(const sycl::uint* const __restrict left_cv,
+        const sycl::uint* const __restrict right_cv,
+        const sycl::uint* const __restrict key_words,
+        sycl::uint* const __restrict out_cv)
+{
+  parent_cv(left_cv, right_cv, key_words, ROOT, out_cv);
+}
+
 }
