@@ -5,6 +5,11 @@
 
 namespace blake3 {
 
+// just to avoid kernel name mangling issue in optimization report
+class kernelBlake3HashChunkifyLeafNodes;
+class kernelBlake3HashParentChaining;
+class kernelBlake3HashRootChaining;
+
 // Following BLAKE3 constants taken from
 // https://github.com/itzmeanjan/blake3/blob/1c58f6a343baee52ba1fe7fc98bfb280b6d567da/include/blake3_consts.hpp
 constexpr size_t MSG_PERMUTATION[16] = { 2, 6,  3,  10, 7, 0,  4,  13,
@@ -374,7 +379,7 @@ hash(sycl::queue& q,
   sycl::uint* mem = static_cast<sycl::uint*>(sycl::malloc_device(mem_size, q));
   const size_t mem_offset = (OUT_LEN >> 2) * chunk_count;
 
-  sycl::event evt_0 = q.single_task<class kernelBlake3HashChunkifyLeafNodes>([=
+  sycl::event evt_0 = q.single_task<kernelBlake3HashChunkifyLeafNodes>([=
   ]() [[intel::kernel_args_restrict]] {
     [[intel::ivdep]]
     for (size_t i = 0; i < chunk_count; i++)
@@ -405,7 +410,7 @@ hash(sycl::queue& q,
       const size_t write_offset = read_offset >> 1;
       const size_t glb_work_items = chunk_count >> (r + 1);
 
-      h.single_task<class kernelBlake3HashParentChaining>([=
+      h.single_task<kernelBlake3HashParentChaining>([=
       ]() [[intel::kernel_args_restrict]] {
         [[intel::ivdep]]
         for (size_t i = 0; i < glb_work_items; i++)
@@ -423,7 +428,7 @@ hash(sycl::queue& q,
 
   sycl::event evt_1 = q.submit([&](sycl::handler& h) {
     h.depends_on(evts.at(rounds - 1));
-    h.single_task<class kernelBlake3HashRootChaining>([=
+    h.single_task<kernelBlake3HashRootChaining>([=
     ]() [[intel::kernel_args_restrict]] {
       root_cv(mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
               mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2),
