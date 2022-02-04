@@ -1,7 +1,7 @@
 #pragma once
 #define SYCL_SIMPLE_SWIZZLES 1
-#include <CL/sycl.hpp>
 #include <cassert>
+#include "common.hpp"
 
 namespace blake3 {
 
@@ -369,7 +369,8 @@ hash(sycl::queue& q,
      const sycl::uchar* const __restrict input,
      const size_t i_size, // bytes
      const size_t chunk_count,
-     sycl::uchar* const __restrict digest)
+     sycl::uchar* const __restrict digest,
+     sycl::cl_ulong *const __restrict ts)
 {
   assert(i_size == chunk_count * CHUNK_LEN);
   // minimum 1MB input size for this implementation
@@ -441,6 +442,21 @@ hash(sycl::queue& q,
 
   evt_1.wait();
   sycl::free(mem, q);
+
+  // if ts is non-null ensure that SYCL queue has profiling
+  // enabled, otherwise following lines should panic !
+  if(ts != nullptr) {
+    sycl::cl_ulong ts_ = 0;
+
+    ts_ += time_event(evt_0);
+    for(size_t i = 0; i < rounds; i++) {
+      ts_ += time_event(evts.at(i));
+    }
+    ts_ += time_event(evt_1);
+
+    // write back total kernel execution time
+    *ts = ts_;
+  }
 }
 
 }
