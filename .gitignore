@@ -1,3 +1,4 @@
-a.out
+*.out
 *.o
 .vscode
+fpga_opt.*
