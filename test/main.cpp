@@ -55,7 +55,7 @@ main(int argc, char** argv)
   // host to device input data tx
   q.memcpy(i_d, i_h, i_size).wait();
   // compute on accelerator, wait until completed
-  blake3::hash(q, i_d, i_size, chunk_count, o_d);
+  blake3::hash(q, i_d, i_size, chunk_count, o_d, nullptr);
   // device to host digest tx
   q.memcpy(o_h, o_d, blake3::OUT_LEN).wait();
 
