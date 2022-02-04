@@ -32,6 +32,13 @@ fpga_opt_test:
 fpga_hw_test:
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_HW_FLAGS) -reuse-exe=test/fpga_hw.out test/main.cpp -o test/fpga_hw.out
 
+fpga_emu_bench:
+	# you should not rely on these numbers !
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_EMU_FLAGS) benchmark/main.cpp -o benchmark/fpga_emu.out
+
+fpga_hw_bench:
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_HW_FLAGS) -reuse-exe=benchmark/fpga_hw.out benchmark/main.cpp -o benchmark/fpga_hw.out
+
 clean:
 	find . -name '*.out' -o -name '*.a' -o -name '*.o' | xargs rm -f
 
