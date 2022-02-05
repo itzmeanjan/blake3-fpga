@@ -1,14 +1,12 @@
 #pragma once
 #define SYCL_SIMPLE_SWIZZLES 1
-#include <cassert>
 #include "common.hpp"
+#include <cassert>
 
 namespace blake3 {
 
 // just to avoid kernel name mangling issue in optimization report
-class kernelBlake3HashChunkifyLeafNodes;
-class kernelBlake3HashParentChaining;
-class kernelBlake3HashRootChaining;
+class kernelBlake3Hash;
 
 // Following BLAKE3 constants taken from
 // https://github.com/itzmeanjan/blake3/blob/1c58f6a343baee52ba1fe7fc98bfb280b6d567da/include/blake3_consts.hpp
@@ -226,9 +224,10 @@ words_from_le_bytes(const sycl::uchar* const __restrict input,
 static inline void
 word_to_le_bytes(const sycl::uint word, sycl::uchar* const output)
 {
- #pragma unroll 4
+#pragma unroll 4
   [[intel::ivdep]]
-  for(size_t i = 0; i < 4; i++) {
+  for (size_t i = 0; i < 4; i++)
+  {
     output[i] = static_cast<sycl::uchar>((word >> (i << 3)) & 0xff);
   }
 }
@@ -267,10 +266,7 @@ chunkify(const sycl::uint* const __restrict key_words,
 
 #pragma unroll 8 // attempt to fully parallelize array initialization !
   [[intel::ivdep]]
-  for (size_t i = 0; i < 8; i++)
-  {
-    in_cv[i] = key_words[i];
-  }
+  for (size_t i = 0; i < 8; i++) { in_cv[i] = key_words[i]; }
 
   // --- begin processing first message block ---
   words_from_le_bytes(input, msg_words);
@@ -283,15 +279,11 @@ chunkify(const sycl::uint* const __restrict key_words,
 
 #pragma unroll 8 // copying between array can be fully parallelized !
   [[intel::ivdep]]
-  for (size_t j = 0; j < 8; j++)
-  {
-    in_cv[j] = priv_out_cv[j];
-  }
+  for (size_t j = 0; j < 8; j++) { in_cv[j] = priv_out_cv[j]; }
   // --- end processing first message block ---
 
   // process intermediate ( read non-boundary ) 14 message blocks
-  for (size_t i = 1; i < 15; i++)
-  {
+  for (size_t i = 1; i < 15; i++) {
     words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
     compress(in_cv, msg_words, chunk_counter, BLOCK_LEN, flags, priv_out_cv);
 
@@ -370,8 +362,10 @@ hash(sycl::queue& q,
      const size_t i_size, // bytes
      const size_t chunk_count,
      sycl::uchar* const __restrict digest,
-     sycl::cl_ulong *const __restrict ts)
+     sycl::cl_ulong* const __restrict ts)
 {
+  // whole input byte array is splitted into N -many chunks, each
+  // of 1024 -bytes width
   assert(i_size == chunk_count * CHUNK_LEN);
   // minimum 1MB input size for this implementation
   assert(chunk_count >= (1 << 10)); // but you would probably want >= 2^20
@@ -379,84 +373,75 @@ hash(sycl::queue& q,
 
   const size_t mem_size = static_cast<size_t>(BLOCK_LEN) * chunk_count;
   sycl::uint* mem = static_cast<sycl::uint*>(sycl::malloc_device(mem_size, q));
-  const size_t mem_offset = (OUT_LEN >> 2) * chunk_count;
 
-  sycl::event evt_0 = q.single_task<kernelBlake3HashChunkifyLeafNodes>([=
-  ]() [[intel::kernel_args_restrict]] {
-    [[intel::ivdep]]
-    for (size_t i = 0; i < chunk_count; i++)
-    {
-      chunkify(IV,
-               static_cast<sycl::ulong>(i),
-               0,
-               input + i * CHUNK_LEN,
-               mem + mem_offset + i * (OUT_LEN >> 2));
-    }
-  });
+  sycl::event evt =
+    q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
+      [[intel::fpga_register]] const size_t mem_offset = (OUT_LEN >> 2) * chunk_count;
 
-  const size_t rounds =
-    static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
-
-  std::vector<sycl::event> evts;
-  evts.reserve(rounds);
-
-  for (size_t r = 0; r < rounds; r++) {
-    sycl::event evt = q.submit([&](sycl::handler& h) {
-      if (r == 0) {
-        h.depends_on(evt_0);
-      } else {
-        h.depends_on(evts.at(r - 1));
+      // compress all chunks so that each chunk produces a single output
+      // chaining value of 32 -bytes, which are to be later used for
+      // computing parent chaining values ( like Binary Merklization )
+      [[intel::ivdep]]
+      for (size_t i = 0; i < chunk_count; i++) {
+        chunkify(IV,
+                 static_cast<sycl::ulong>(i),
+                 0,
+                 input + i * CHUNK_LEN,
+                 mem + mem_offset + i * (OUT_LEN >> 2));
       }
 
-      const size_t read_offset = mem_offset >> r;
-      const size_t write_offset = read_offset >> 1;
-      const size_t glb_work_items = chunk_count >> (r + 1);
+      // `chunk_count` -many leaf nodes of BLAKE3's internal binary merkle tree
+      // to be merged in `rounds` -many dispatch rounds such that we reach
+      // root node ( i.e. chaining value ) level of merkle tree
+      [[intel::fpga_register]] const size_t rounds =
+        static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
 
-      h.single_task<kernelBlake3HashParentChaining>([=
-      ]() [[intel::kernel_args_restrict]] {
+      // process each level of nodes of BLAKE3's internal binary merkle tree
+      // in order
+      //
+      // as round 0 must complete before round 1 can begin, I can't let compiler
+      // coalesce following nested loop construction
+      [[intel::loop_coalesce(1)]]
+      for (size_t r = 0; r < rounds; r++) {
+        [[intel::fpga_register]] const size_t read_offset = mem_offset >> r;
+        [[intel::fpga_register]] const size_t write_offset = read_offset >> 1;
+        [[intel::fpga_register]] const size_t parent_count = chunk_count >> (r + 1);
+
+        // computing output chaining values of all children nodes of 
+        // some level of BlAKE3 binary merkle tree
+        // can occur in parallel, no data dependency !
+        //
+        // but ensure that following loop completes execution for (r = 0, see above)
+        // before r = 1's body execution can begin, due to presence of critical
+        // data dependency !
         [[intel::ivdep]]
-        for (size_t i = 0; i < glb_work_items; i++)
-        {
+        for (size_t i = 0; i < parent_count; i++) {
           parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
                     mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
                     IV,
                     0,
                     mem + write_offset + i * (OUT_LEN >> 2));
         }
-      });
-    });
-    evts.push_back(evt);
-  }
+      }
 
-  sycl::event evt_1 = q.submit([&](sycl::handler& h) {
-    h.depends_on(evts.at(rounds - 1));
-    h.single_task<kernelBlake3HashRootChaining>([=
-    ]() [[intel::kernel_args_restrict]] {
+      // finally compute root chaining value ( which is digest ) of BLAKE3 
+      // merkle tree
       root_cv(mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
               mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2),
               IV,
               mem + 1 * (OUT_LEN >> 2));
+      // write 32 -bytes BLAKE3 digest back to allocated memory !
       words_to_le_bytes(mem + 1 * (OUT_LEN >> 2), digest);
     });
-  });
 
-  evt_1.wait();
+  evt.wait();
   sycl::free(mem, q);
 
   // if ts is non-null ensure that SYCL queue has profiling
   // enabled, otherwise following lines should panic !
-  if(ts != nullptr) {
-    sycl::cl_ulong ts_ = 0;
-
-    ts_ += time_event(evt_0);
-    for(size_t i = 0; i < rounds; i++) {
-      ts_ += time_event(evts.at(i));
-    }
-    ts_ += time_event(evt_1);
-
+  if (ts != nullptr) {
     // write back total kernel execution time
-    *ts = ts_;
+    *ts = time_event(evt);
   }
 }
-
 }
