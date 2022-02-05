@@ -138,24 +138,24 @@ compress(const sycl::uint* in_cv,
 {
   // initial hash state, which will consume all sixteen message words ( = 64
   // -bytes total ) and produce output chaining value of this message block
-  [[intel::fpga_memory]] sycl::uint state[16] = {
-    in_cv[0],
-    in_cv[1],
-    in_cv[2],
-    in_cv[3],
-    in_cv[4],
-    in_cv[5],
-    in_cv[6],
-    in_cv[7],
-    IV[0],
-    IV[1],
-    IV[2],
-    IV[3],
-    static_cast<sycl::uint>(counter & 0xffffffff),
-    static_cast<sycl::uint>(counter >> 32),
-    block_len,
-    flags
-  };
+  [[intel::fpga_memory]] sycl::uint state[16];
+
+  // --- initialising hash state, begins ---
+#pragma unroll 8
+  for (size_t i = 0; i < 8; i++) {
+    state[i] = in_cv[i];
+  }
+
+#pragma unroll 4
+  for (size_t i = 0; i < 4; i++) {
+    state[8 + i] = IV[i];
+  }
+
+  state[12] = static_cast<sycl::uint>(counter & 0xffffffff);
+  state[13] = static_cast<sycl::uint>(counter >> 32);
+  state[14] = block_len;
+  state[15] = flags;
+  // --- initialising hash state, ends ---
 
   // round 1
   rnd(state, msg_words);
@@ -379,8 +379,7 @@ hash(sycl::queue& q,
       // compress all chunks so that each chunk produces a single output
       // chaining value of 32 -bytes, which are to be later used for
       // computing parent chaining values ( like Binary Merklization )
-      [[intel::ivdep]]
-      for (size_t i = 0; i < chunk_count; i++)
+      [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
       {
         chunkify(IV,
                  static_cast<sycl::ulong>(i),
@@ -400,8 +399,7 @@ hash(sycl::queue& q,
       //
       // as round 0 must complete before round 1 can begin, I can't let compiler
       // coalesce following nested loop construction
-      [[intel::loop_coalesce(1)]]
-      for (size_t r = 0; r < rounds; r++)
+      [[intel::loop_coalesce(1)]] for (size_t r = 0; r < rounds; r++)
       {
         [[intel::fpga_register]] const size_t read_offset = mem_offset >> r;
         [[intel::fpga_register]] const size_t write_offset = read_offset >> 1;
@@ -415,8 +413,7 @@ hash(sycl::queue& q,
         // but ensure that following loop completes execution for (r = 0, see
         // above) before r = 1's body execution can begin, due to presence of
         // critical data dependency !
-        [[intel::ivdep]]
-        for (size_t i = 0; i < parent_count; i++)
+        [[intel::ivdep]] for (size_t i = 0; i < parent_count; i++)
         {
           parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
                     mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
