@@ -82,17 +82,99 @@ g(sycl::uint* const __restrict state,
 static inline void
 rnd(sycl::uint* const __restrict state, const sycl::uint* const __restrict msg)
 {
-  // Mixing first eight message words of block into state column-wise
-  g(state, 0, 4, 8, 12, msg[0], msg[1]);
-  g(state, 1, 5, 9, 13, msg[2], msg[3]);
-  g(state, 2, 6, 10, 14, msg[4], msg[5]);
-  g(state, 3, 7, 11, 15, msg[6], msg[7]);
+// Mixing first eight message words of block into state column-wise
+#pragma unroll 4
+  for (size_t i = 0; i < 4; i++) {
+    state[0 + i] += state[4 + i] + msg[i << 1];
+    state[12 + i] = rotr<16>(state[12 + i] ^ state[0 + i]);
+    state[8 + i] += state[12 + i];
+    state[4 + i] = rotr<12>(state[4 + i] ^ state[8 + i]);
 
-  // Mixing last eight message words of block into state diagonally
-  g(state, 0, 5, 10, 15, msg[8], msg[9]);
-  g(state, 1, 6, 11, 12, msg[10], msg[11]);
-  g(state, 2, 7, 8, 13, msg[12], msg[13]);
-  g(state, 3, 4, 9, 14, msg[14], msg[15]);
+    state[0 + i] += state[4 + i] + msg[(i << 1) + 1];
+    state[12 + i] = rotr<8>(state[12 + i] ^ state[0 + i]);
+    state[8 + i] += state[12 + i];
+    state[4 + i] = rotr<7>(state[4 + i] ^ state[8 + i]);
+  }
+
+  // following three code blocks help in diagonalizing 4x4 hash state matrix
+  //
+  // note, row 0 doesn't need to be touched !
+  //
+  // diagonalize row 1 of 4x4 state matrix
+  {
+    [[intel::fpga_register]] const sycl::uint tmp = state[4];
+    for (size_t i = 4; i < 7; i++) {
+      state[i] = state[i + 1];
+    }
+    state[7] = tmp;
+  }
+
+  // diagonalize row 2 of 4x4 state matrix
+  {
+    [[intel::fpga_register]] const sycl::uint tmp0 = state[8];
+    [[intel::fpga_register]] const sycl::uint tmp1 = state[9];
+    for (size_t i = 8; i < 10; i++) {
+      state[i] = state[i + 2];
+    }
+    state[10] = tmp0;
+    state[11] = tmp1;
+  }
+
+  // diagonalize row 3 of 4x4 state matrix
+  {
+    [[intel::fpga_register]] const sycl::uint tmp = state[15];
+    for (size_t i = 15; i > 12; i--) {
+      state[i] = state[i - 1];
+    }
+    state[12] = tmp;
+  }
+
+// Mixing last eight message words of block into state diagonally
+#pragma unroll 4
+  for (size_t i = 0; i < 4; i++) {
+    state[0 + i] += state[4 + i] + msg[8 + (i << 1)];
+    state[12 + i] = rotr<16>(state[12 + i] ^ state[0 + i]);
+    state[8 + i] += state[12 + i];
+    state[4 + i] = rotr<12>(state[4 + i] ^ state[8 + i]);
+
+    state[0 + i] += state[4 + i] + msg[8 + (i << 1) + 1];
+    state[12 + i] = rotr<8>(state[12 + i] ^ state[0 + i]);
+    state[8 + i] += state[12 + i];
+    state[4 + i] = rotr<7>(state[4 + i] ^ state[8 + i]);
+  }
+
+  // following three code blocks help in un-diagonalizing 4x4 hash state matrix
+  //
+  // note, row 0 doesn't need to be touched !
+  //
+  // un-diagonalize row 1 of 4x4 state matrix
+  {
+    [[intel::fpga_register]] const sycl::uint tmp = state[7];
+    for (size_t i = 7; i > 4; i--) {
+      state[i] = state[i - 1];
+    }
+    state[4] = tmp;
+  }
+
+  // un-diagonalize row 2 of 4x4 state matrix
+  {
+    [[intel::fpga_register]] const sycl::uint tmp0 = state[8];
+    [[intel::fpga_register]] const sycl::uint tmp1 = state[9];
+    for (size_t i = 8; i < 10; i++) {
+      state[i] = state[i + 2];
+    }
+    state[10] = tmp0;
+    state[11] = tmp1;
+  }
+
+  // un-diagonalize row 3 of 4x4 state matrix
+  {
+    [[intel::fpga_register]] const sycl::uint tmp = state[12];
+    for (size_t i = 12; i < 15; i++) {
+      state[i] = state[i + 1];
+    }
+    state[15] = tmp;
+  }
 }
 
 // Permute sixteen BLAKE3 message words of each 64 -bytes wide block, after
@@ -109,14 +191,16 @@ permute(sycl::uint* const msg_words)
 {
   // additional array memory ( = 64 -bytes ) for helping in message word
   // permutation
-  [[intel::fpga_memory]] sycl::uint permuted[16];
+  [[intel::fpga_memory("MLAB"),
+    intel::numbanks(2),
+    intel::max_replicates(8)]] sycl::uint permuted[16];
 
-#pragma unroll 16 // fully unroll this loop
+#pragma unroll 8
   for (size_t i = 0; i < 16; i++) {
     permuted[i] = msg_words[MSG_PERMUTATION[i]];
   }
 
-#pragma unroll 16 // fully unroll this loop
+#pragma unroll 8
   for (size_t i = 0; i < 16; i++) {
     msg_words[i] = permuted[i];
   }
@@ -138,7 +222,10 @@ compress(const sycl::uint* in_cv,
 {
   // initial hash state, which will consume all sixteen message words ( = 64
   // -bytes total ) and produce output chaining value of this message block
-  [[intel::fpga_memory]] sycl::uint state[16];
+  [[intel::fpga_memory("MLAB"),
+    intel::bankwidth(16),
+    intel::numbanks(4),
+    intel::max_replicates(4)]] sycl::uint state[16];
 
   // --- initialising hash state, begins ---
 #pragma unroll 8
@@ -264,9 +351,9 @@ chunkify(const sycl::uint* const __restrict key_words,
          const sycl::uchar* const __restrict input,
          sycl::uint* const __restrict out_cv)
 {
-  [[intel::fpga_memory]] sycl::uint in_cv[8];
-  [[intel::fpga_memory]] sycl::uint priv_out_cv[8];
-  [[intel::fpga_memory]] sycl::uint msg_words[16];
+  [[intel::fpga_memory("MLAB")]] sycl::uint in_cv[8];
+  [[intel::fpga_memory("MLAB")]] sycl::uint priv_out_cv[8];
+  [[intel::fpga_memory("MLAB")]] sycl::uint msg_words[16];
 
 #pragma unroll 8 // attempt to fully parallelize array initialization !
   for (size_t i = 0; i < 8; i++) {
@@ -318,7 +405,7 @@ parent_cv(const sycl::uint* const __restrict left_cv,
           const sycl::uint flags,
           sycl::uint* const __restrict out_cv)
 {
-  [[intel::fpga_memory]] sycl::uint block_words[16];
+  [[intel::fpga_memory("MLAB")]] sycl::uint block_words[16];
 
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
@@ -379,7 +466,9 @@ hash(sycl::queue& q,
       // compress all chunks so that each chunk produces a single output
       // chaining value of 32 -bytes, which are to be later used for
       // computing parent chaining values ( like Binary Merklization )
-      [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
+#pragma unroll 4
+      [[intel::ivdep]]
+      for (size_t i = 0; i < chunk_count; i++)
       {
         chunkify(IV,
                  static_cast<sycl::ulong>(i),
@@ -413,7 +502,9 @@ hash(sycl::queue& q,
         // but ensure that following loop completes execution for (r = 0, see
         // above) before r = 1's body execution can begin, due to presence of
         // critical data dependency !
-        [[intel::ivdep]] for (size_t i = 0; i < parent_count; i++)
+#pragma unroll 2
+        [[intel::ivdep]]
+        for (size_t i = 0; i < parent_count; i++)
         {
           parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
                     mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
