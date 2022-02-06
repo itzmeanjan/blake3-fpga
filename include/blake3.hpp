@@ -49,31 +49,6 @@ rotr(sycl::uint word) requires(valid_bit_pos(bit_pos))
   return (word >> bit_pos) | (word << (32 - bit_pos));
 }
 
-// Mixes two message words into 64 -bytes wide state either column-wise/
-// diagonally
-//
-// See
-// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L42-L52
-static inline void
-g(sycl::uint* const __restrict state,
-  const size_t a,
-  const size_t b,
-  const size_t c,
-  const size_t d,
-  const sycl::uint mx,
-  const sycl::uint my)
-{
-  state[a] = state[a] + state[b] + mx;
-  state[d] = rotr<16>(state[d] ^ state[a]);
-  state[c] = state[c] + state[d];
-  state[b] = rotr<12>(state[b] ^ state[c]);
-
-  state[a] = state[a] + state[b] + my;
-  state[d] = rotr<8>(state[d] ^ state[a]);
-  state[c] = state[c] + state[d];
-  state[b] = rotr<7>(state[b] ^ state[c]);
-}
-
 // BLAKE3 round, applied 7 times for mixing sixteen message words ( = total 64
 // -bytes ) into hash state, both column-wise and diagonally !
 //
