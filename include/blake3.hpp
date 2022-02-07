@@ -238,6 +238,12 @@ chunkify(
 )
 {
   // initialise hash state for first message block of chunk
+  //
+  // for all further message block compression, previous block's
+  // output chaining values to be used as input chaining values
+  //
+  // that means, output chaining value obtained after any compress function
+  // invocation, should be living over first 8 words of hash state
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
     state[i] = IV[i];
@@ -253,6 +259,9 @@ chunkify(
 
   // compress last message block of 1024 -bytes wide chunk
   compress(state, msg_blocks + (15u << 4), chunk_counter, BLOCK_LEN, CHUNK_END);
+  //
+  // after last message block of chunk is compressed, output chaining value of
+  // whole chunk can be found on first 8 words of hash state
 }
 
 // Computes chaining value for some parent ( intermediate, but non-root ) node
@@ -269,7 +278,7 @@ parent_cv(uint32_t* const __restrict state, // hash state
 {
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
-    // setting first 8 message words of hash state
+    // setting first 8 words of hash state
     state[i] = IV[i];
   }
 
@@ -283,6 +292,9 @@ parent_cv(uint32_t* const __restrict state, // hash state
   }
 
   compress(state, msg_words, 0, BLOCK_LEN, flags | PARENT);
+  //
+  // find output chaining value of this parent, in first 8 words
+  // of hash state
 }
 
 // Computes BLAKE3 merkle tree's root chaining value ( 32 -bytes ) by
