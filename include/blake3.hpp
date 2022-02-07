@@ -1,5 +1,4 @@
 #pragma once
-#define SYCL_SIMPLE_SWIZZLES 1
 #include "common.hpp"
 #include <cassert>
 
@@ -111,14 +110,14 @@ permute(uint32_t* const msg_words)
   // permutation
   //
   // probably going to be optimized such that it's not synthesized !
-  [[intel::fpga_memory]] uint32_t permuted[16];
+  [[intel::fpga_memory("BLOCK_RAM")]] uint32_t permuted[16];
 
-#pragma unroll 8
+#pragma unroll 16
   for (size_t i = 0; i < 16; i++) {
     permuted[i] = msg_words[MSG_PERMUTATION[i]];
   }
 
-#pragma unroll 8
+#pragma unroll 16
   for (size_t i = 0; i < 16; i++) {
     msg_words[i] = permuted[i];
   }
@@ -201,18 +200,6 @@ word_from_le_bytes(const sycl::uchar* const input)
          static_cast<uint32_t>(input[0]) << 0;
 }
 
-// 64 little endian input bytes of a message block to be interpreted as sixteen
-// BLAKE3 words ( = uint32_t each )
-static inline void
-words_from_le_bytes(const sycl::uchar* const __restrict input,
-                    uint32_t* const __restrict msg_words)
-{
-#pragma unroll 16
-  for (size_t i = 0; i < 16; i++) {
-    msg_words[i] = word_from_le_bytes(input + (i << 2));
-  }
-}
-
 // One 32 -bit BLAKE3 word is converted to four consecutive little endian bytes
 static inline void
 word_to_le_bytes(const uint32_t word, sycl::uchar* const output)
@@ -243,9 +230,11 @@ words_to_le_bytes(const uint32_t* const __restrict msg_words,
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1790-L1842
 static inline void
-chunkify(const uint64_t chunk_counter,
-         uint32_t* const __restrict state,     // hash state
-         uint32_t* const __restrict msg_blocks // message words to be compressed
+chunkify(
+  const uint64_t chunk_counter,
+  uint32_t* const __restrict state,     // hash state
+  uint32_t* const __restrict msg_blocks // 256 message words ( i.e. 16 message
+                                        // blocks ) to be compressed
 )
 {
   // initialise hash state for first message block of chunk
@@ -254,13 +243,16 @@ chunkify(const uint64_t chunk_counter,
     state[i] = IV[i];
   }
 
+  // compress first message block of 1024 -bytes wide chunk
   compress(state, msg_blocks, chunk_counter, BLOCK_LEN, CHUNK_START);
 
+  // intermediate 14 message blocks to be compressed in order
   for (size_t j = 1; j < 15; j++) {
     compress(state, msg_blocks + (j << 4), chunk_counter, BLOCK_LEN, 0);
   }
 
-  compress(state, msg_blocks + (15 << 4), chunk_counter, BLOCK_LEN, CHUNK_END);
+  // compress last message block of 1024 -bytes wide chunk
+  compress(state, msg_blocks + (15u << 4), chunk_counter, BLOCK_LEN, CHUNK_END);
 }
 
 // Computes chaining value for some parent ( intermediate, but non-root ) node
@@ -382,7 +374,7 @@ hash(sycl::queue& q,
         // as round 0 must complete before round 1 can begin, I can't let
         // compiler coalesce following nested loop construction
         for (size_t r = 0; r < rounds; r++) {
-          read_offset = ((OUT_LEN >> 2) * chunk_count) >> r;
+          read_offset = (chunk_count << 3) >> r;
           write_offset = read_offset >> 1;
           parent_count = chunk_count >> (r + 1);
 
@@ -397,13 +389,13 @@ hash(sycl::queue& q,
           {
             parent_cv(state,
                       msg_words,
-                      mem + read_offset + (i << 1) * (OUT_LEN >> 2),
-                      mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
+                      mem + read_offset + ((i << 1) << 3),
+                      mem + read_offset + (((i << 1) + 1) << 3),
                       0);
 
 #pragma unroll 8
             for (size_t j = 0; j < 8; j++) {
-              mem[write_offset + i * (OUT_LEN >> 2) + j] = state[j];
+              mem[write_offset + (i << 3) + j] = state[j];
             }
           }
         }
@@ -414,10 +406,7 @@ hash(sycl::queue& q,
 
       // finally compute root chaining value ( which is digest ) of BLAKE3
       // merkle tree
-      root_cv(state,
-              msg_words,
-              mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
-              mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2));
+      root_cv(state, msg_words, mem + 16ul + (0 << 3), mem + 16ul + (1 << 3));
 
       // write 32 -bytes BLAKE3 digest back to allocated memory !
       words_to_le_bytes(state, digest);
