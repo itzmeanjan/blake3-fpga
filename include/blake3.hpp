@@ -166,9 +166,9 @@ permute(sycl::uint* const msg_words)
 {
   // additional array memory ( = 64 -bytes ) for helping in message word
   // permutation
-  [[intel::fpga_memory("MLAB"),
-    intel::numbanks(2),
-    intel::max_replicates(8)]] sycl::uint permuted[16];
+  //
+  // probably going to be optimized such that it's not synthesized !
+  [[intel::fpga_memory]] sycl::uint permuted[16];
 
 #pragma unroll 8
   for (size_t i = 0; i < 16; i++) {
@@ -197,10 +197,7 @@ compress(const sycl::uint* in_cv,
 {
   // initial hash state, which will consume all sixteen message words ( = 64
   // -bytes total ) and produce output chaining value of this message block
-  [[intel::fpga_memory("MLAB"),
-    intel::bankwidth(16),
-    intel::numbanks(4),
-    intel::max_replicates(4)]] sycl::uint state[16];
+  [[intel::fpga_memory("MLAB")]] sycl::uint state[16];
 
   // --- initialising hash state, begins ---
 #pragma unroll 8
@@ -326,9 +323,9 @@ chunkify(const sycl::uint* const __restrict key_words,
          const sycl::uchar* const __restrict input,
          sycl::uint* const __restrict out_cv)
 {
-  [[intel::fpga_memory("MLAB")]] sycl::uint in_cv[8];
-  [[intel::fpga_memory("MLAB")]] sycl::uint priv_out_cv[8];
-  [[intel::fpga_memory("MLAB")]] sycl::uint msg_words[16];
+  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint in_cv[8];
+  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint priv_out_cv[8];
+  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint msg_words[16];
 
 #pragma unroll 8 // attempt to fully parallelize array initialization !
   for (size_t i = 0; i < 8; i++) {
@@ -380,7 +377,7 @@ parent_cv(const sycl::uint* const __restrict left_cv,
           const sycl::uint flags,
           sycl::uint* const __restrict out_cv)
 {
-  [[intel::fpga_memory("MLAB")]] sycl::uint block_words[16];
+  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint block_words[16];
 
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
