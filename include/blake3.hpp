@@ -14,21 +14,21 @@ constexpr size_t MSG_PERMUTATION[16] = { 2, 6,  3,  10, 7, 0,  4,  13,
                                          1, 11, 12, 5,  9, 14, 15, 8 };
 
 // Initial hash values
-constexpr sycl::uint IV[8] = { 0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-                               0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19 };
+constexpr uint32_t IV[8] = { 0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+                             0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19 };
 
-constexpr size_t CHUNK_LEN = 1024;   // bytes
-constexpr size_t OUT_LEN = 32;       // bytes
-constexpr sycl::uint BLOCK_LEN = 64; // bytes
+constexpr size_t CHUNK_LEN = 1024; // bytes
+constexpr size_t OUT_LEN = 32;     // bytes
+constexpr uint32_t BLOCK_LEN = 64; // bytes
 
 // Mixing rounds
 constexpr size_t ROUNDS = 7;
 
 // BLAKE3 flags
-constexpr sycl::uint CHUNK_START = 1 << 0;
-constexpr sycl::uint CHUNK_END = 1 << 1;
-constexpr sycl::uint PARENT = 1 << 2;
-constexpr sycl::uint ROOT = 1 << 3;
+constexpr uint32_t CHUNK_START = 1 << 0;
+constexpr uint32_t CHUNK_END = 1 << 1;
+constexpr uint32_t PARENT = 1 << 2;
+constexpr uint32_t ROOT = 1 << 3;
 
 // Compile time check for template function argument; checks whether
 // requested rotation bit positions for message word ( = 32 -bit )
@@ -43,10 +43,35 @@ valid_bit_pos(size_t bit_pos)
 // rightwards, by N -bit places ( note 0 <= N < 32 ), where N must
 // be compile time constant !
 template<size_t bit_pos>
-static inline const sycl::uint
-rotr(sycl::uint word) requires(valid_bit_pos(bit_pos))
+static inline const uint32_t
+rotr(uint32_t word) requires(valid_bit_pos(bit_pos))
 {
   return (word >> bit_pos) | (word << (32 - bit_pos));
+}
+
+// Mixes two message words into 64 -bytes wide state either column-wise/
+// diagonally
+//
+// See
+// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L42-L52
+static inline void
+g(uint32_t* const __restrict state,
+  const size_t a,
+  const size_t b,
+  const size_t c,
+  const size_t d,
+  const uint32_t mx,
+  const uint32_t my)
+{
+  state[a] = state[a] + state[b] + mx;
+  state[d] = rotr<16>(state[d] ^ state[a]);
+  state[c] = state[c] + state[d];
+  state[b] = rotr<12>(state[b] ^ state[c]);
+
+  state[a] = state[a] + state[b] + my;
+  state[d] = rotr<8>(state[d] ^ state[a]);
+  state[c] = state[c] + state[d];
+  state[b] = rotr<7>(state[b] ^ state[c]);
 }
 
 // BLAKE3 round, applied 7 times for mixing sixteen message words ( = total 64
@@ -55,101 +80,19 @@ rotr(sycl::uint word) requires(valid_bit_pos(bit_pos))
 // See
 // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L54-L65
 static inline void
-rnd(sycl::uint* const __restrict state, const sycl::uint* const __restrict msg)
+rnd(uint32_t* const __restrict state, const uint32_t* const __restrict msg)
 {
-// Mixing first eight message words of block into state column-wise
-#pragma unroll 4
-  for (size_t i = 0; i < 4; i++) {
-    state[0 + i] += state[4 + i] + msg[i << 1];
-    state[12 + i] = rotr<16>(state[12 + i] ^ state[0 + i]);
-    state[8 + i] += state[12 + i];
-    state[4 + i] = rotr<12>(state[4 + i] ^ state[8 + i]);
+  // Mixing first eight message words of block into state column-wise
+  g(state, 0, 4, 8, 12, msg[0], msg[1]);
+  g(state, 1, 5, 9, 13, msg[2], msg[3]);
+  g(state, 2, 6, 10, 14, msg[4], msg[5]);
+  g(state, 3, 7, 11, 15, msg[6], msg[7]);
 
-    state[0 + i] += state[4 + i] + msg[(i << 1) + 1];
-    state[12 + i] = rotr<8>(state[12 + i] ^ state[0 + i]);
-    state[8 + i] += state[12 + i];
-    state[4 + i] = rotr<7>(state[4 + i] ^ state[8 + i]);
-  }
-
-  // following three code blocks help in diagonalizing 4x4 hash state matrix
-  //
-  // note, row 0 doesn't need to be touched !
-  //
-  // diagonalize row 1 of 4x4 state matrix
-  {
-    [[intel::fpga_register]] const sycl::uint tmp = state[4];
-    for (size_t i = 4; i < 7; i++) {
-      state[i] = state[i + 1];
-    }
-    state[7] = tmp;
-  }
-
-  // diagonalize row 2 of 4x4 state matrix
-  {
-    [[intel::fpga_register]] const sycl::uint tmp0 = state[8];
-    [[intel::fpga_register]] const sycl::uint tmp1 = state[9];
-    for (size_t i = 8; i < 10; i++) {
-      state[i] = state[i + 2];
-    }
-    state[10] = tmp0;
-    state[11] = tmp1;
-  }
-
-  // diagonalize row 3 of 4x4 state matrix
-  {
-    [[intel::fpga_register]] const sycl::uint tmp = state[15];
-    for (size_t i = 15; i > 12; i--) {
-      state[i] = state[i - 1];
-    }
-    state[12] = tmp;
-  }
-
-// Mixing last eight message words of block into state diagonally
-#pragma unroll 4
-  for (size_t i = 0; i < 4; i++) {
-    state[0 + i] += state[4 + i] + msg[8 + (i << 1)];
-    state[12 + i] = rotr<16>(state[12 + i] ^ state[0 + i]);
-    state[8 + i] += state[12 + i];
-    state[4 + i] = rotr<12>(state[4 + i] ^ state[8 + i]);
-
-    state[0 + i] += state[4 + i] + msg[8 + (i << 1) + 1];
-    state[12 + i] = rotr<8>(state[12 + i] ^ state[0 + i]);
-    state[8 + i] += state[12 + i];
-    state[4 + i] = rotr<7>(state[4 + i] ^ state[8 + i]);
-  }
-
-  // following three code blocks help in un-diagonalizing 4x4 hash state matrix
-  //
-  // note, row 0 doesn't need to be touched !
-  //
-  // un-diagonalize row 1 of 4x4 state matrix
-  {
-    [[intel::fpga_register]] const sycl::uint tmp = state[7];
-    for (size_t i = 7; i > 4; i--) {
-      state[i] = state[i - 1];
-    }
-    state[4] = tmp;
-  }
-
-  // un-diagonalize row 2 of 4x4 state matrix
-  {
-    [[intel::fpga_register]] const sycl::uint tmp0 = state[8];
-    [[intel::fpga_register]] const sycl::uint tmp1 = state[9];
-    for (size_t i = 8; i < 10; i++) {
-      state[i] = state[i + 2];
-    }
-    state[10] = tmp0;
-    state[11] = tmp1;
-  }
-
-  // un-diagonalize row 3 of 4x4 state matrix
-  {
-    [[intel::fpga_register]] const sycl::uint tmp = state[12];
-    for (size_t i = 12; i < 15; i++) {
-      state[i] = state[i + 1];
-    }
-    state[15] = tmp;
-  }
+  // Mixing last eight message words of block into state diagonally
+  g(state, 0, 5, 10, 15, msg[8], msg[9]);
+  g(state, 1, 6, 11, 12, msg[10], msg[11]);
+  g(state, 2, 7, 8, 13, msg[12], msg[13]);
+  g(state, 3, 4, 9, 14, msg[14], msg[15]);
 }
 
 // Permute sixteen BLAKE3 message words of each 64 -bytes wide block, after
@@ -162,13 +105,13 @@ rnd(sycl::uint* const __restrict state, const sycl::uint* const __restrict msg)
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1623-L1639
 inline void
-permute(sycl::uint* const msg_words)
+permute(uint32_t* const msg_words)
 {
   // additional array memory ( = 64 -bytes ) for helping in message word
   // permutation
   //
   // probably going to be optimized such that it's not synthesized !
-  [[intel::fpga_memory]] sycl::uint permuted[16];
+  [[intel::fpga_memory]] uint32_t permuted[16];
 
 #pragma unroll 8
   for (size_t i = 0; i < 16; i++) {
@@ -188,16 +131,16 @@ permute(sycl::uint* const msg_words)
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1641-L1703
 static inline void
-compress(const sycl::uint* in_cv,
-         sycl::uint* const __restrict msg_words,
-         const sycl::ulong counter,
-         const sycl::uint block_len,
-         const sycl::uint flags,
-         sycl::uint* const __restrict out_cv)
+compress(const uint32_t* in_cv,
+         uint32_t* const __restrict msg_words,
+         const uint64_t counter,
+         const uint32_t block_len,
+         const uint32_t flags,
+         uint32_t* const __restrict out_cv)
 {
   // initial hash state, which will consume all sixteen message words ( = 64
   // -bytes total ) and produce output chaining value of this message block
-  [[intel::fpga_memory("MLAB")]] sycl::uint state[16];
+  [[intel::fpga_memory("MLAB")]] uint32_t state[16];
 
   // --- initialising hash state, begins ---
 #pragma unroll 8
@@ -210,8 +153,8 @@ compress(const sycl::uint* in_cv,
     state[8 + i] = IV[i];
   }
 
-  state[12] = static_cast<sycl::uint>(counter & 0xffffffff);
-  state[13] = static_cast<sycl::uint>(counter >> 32);
+  state[12] = static_cast<uint32_t>(counter & 0xffffffff);
+  state[13] = static_cast<uint32_t>(counter >> 32);
   state[14] = block_len;
   state[15] = flags;
   // --- initialising hash state, ends ---
@@ -244,9 +187,12 @@ compress(const sycl::uint* in_cv,
   rnd(state, msg_words);
   // no need to permute message words anymore !
 
+  // output chaining value of this block to be used as
+  // input chaining value for next block in same chunk
+  //
 #pragma unroll 8 // fully parallelize loop, not data dependency
   for (size_t i = 0; i < 8; i++) {
-    state[i] = state[i] ^ state[i + 8];
+    out_cv[i] = state[i] ^ state[i + 8];
     // notice I'm skipping
     // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
     // because that statement doesn't dictate what output chaining value of this
@@ -254,32 +200,24 @@ compress(const sycl::uint* in_cv,
     //
     // So it's safe to do so !
   }
-
-  // output chaining value of this block to be used as
-  // input chaining value for next block in same chunk
-#pragma unroll 4
-  for (size_t i = 0; i < 4; i++) {
-    out_cv[i] = state[i];
-    out_cv[i + 4] = state[i + 4];
-  }
 }
 
 // Four consecutive little endian bytes are interpreted as 32 -bit unsigned
 // integer i.e. BLAKE3 message word
-static inline const sycl::uint
+static inline const uint32_t
 word_from_le_bytes(const sycl::uchar* const input)
 {
-  return static_cast<sycl::uint>(input[3]) << 24 |
-         static_cast<sycl::uint>(input[2]) << 16 |
-         static_cast<sycl::uint>(input[1]) << 8 |
-         static_cast<sycl::uint>(input[0]) << 0;
+  return static_cast<uint32_t>(input[3]) << 24 |
+         static_cast<uint32_t>(input[2]) << 16 |
+         static_cast<uint32_t>(input[1]) << 8 |
+         static_cast<uint32_t>(input[0]) << 0;
 }
 
 // 64 little endian input bytes of a message block to be interpreted as sixteen
 // BLAKE3 words ( = uint32_t each )
 static inline void
 words_from_le_bytes(const sycl::uchar* const __restrict input,
-                    sycl::uint* const __restrict msg_words)
+                    uint32_t* const __restrict msg_words)
 {
 #pragma unroll 16
   for (size_t i = 0; i < 16; i++) {
@@ -289,7 +227,7 @@ words_from_le_bytes(const sycl::uchar* const __restrict input,
 
 // One 32 -bit BLAKE3 word is converted to four consecutive little endian bytes
 static inline void
-word_to_le_bytes(const sycl::uint word, sycl::uchar* const output)
+word_to_le_bytes(const uint32_t word, sycl::uchar* const output)
 {
 #pragma unroll 4
   for (size_t i = 0; i < 4; i++) {
@@ -300,7 +238,7 @@ word_to_le_bytes(const sycl::uint word, sycl::uchar* const output)
 // Eight consecutive BLAKE3 message words are converted to 32 little endian
 // bytes
 static inline void
-words_to_le_bytes(const sycl::uint* const __restrict msg_words,
+words_to_le_bytes(const uint32_t* const __restrict msg_words,
                   sycl::uchar* const __restrict output)
 {
 #pragma unroll 8
@@ -317,15 +255,15 @@ words_to_le_bytes(const sycl::uint* const __restrict msg_words,
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1790-L1842
 void
-chunkify(const sycl::uint* const __restrict key_words,
-         const sycl::ulong chunk_counter,
-         const sycl::uint flags,
+chunkify(const uint32_t* const __restrict key_words,
+         const uint64_t chunk_counter,
+         const uint32_t flags,
          const sycl::uchar* const __restrict input,
-         sycl::uint* const __restrict out_cv)
+         uint32_t* const __restrict out_cv)
 {
-  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint in_cv[8];
-  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint priv_out_cv[8];
-  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint msg_words[16];
+  [[intel::fpga_memory]] uint32_t in_cv[8];
+  [[intel::fpga_memory]] uint32_t priv_out_cv[8];
+  [[intel::fpga_memory]] uint32_t msg_words[16];
 
 #pragma unroll 8 // attempt to fully parallelize array initialization !
   for (size_t i = 0; i < 8; i++) {
@@ -371,13 +309,13 @@ chunkify(const sycl::uint* const __restrict key_words,
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1844-L1865
 static inline void
-parent_cv(const sycl::uint* const __restrict left_cv,
-          const sycl::uint* const __restrict right_cv,
-          const sycl::uint* const __restrict key_words,
-          const sycl::uint flags,
-          sycl::uint* const __restrict out_cv)
+parent_cv(const uint32_t* const __restrict left_cv,
+          const uint32_t* const __restrict right_cv,
+          const uint32_t* const __restrict key_words,
+          const uint32_t flags,
+          uint32_t* const __restrict out_cv)
 {
-  [[intel::fpga_memory("BLOCK_RAM")]] sycl::uint block_words[16];
+  [[intel::fpga_memory("BLOCK_RAM")]] uint32_t block_words[16];
 
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
@@ -397,10 +335,10 @@ parent_cv(const sycl::uint* const __restrict left_cv,
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1867-L1874
 static inline void
-root_cv(const sycl::uint* const __restrict left_cv,
-        const sycl::uint* const __restrict right_cv,
-        const sycl::uint* const __restrict key_words,
-        sycl::uint* const __restrict out_cv)
+root_cv(const uint32_t* const __restrict left_cv,
+        const uint32_t* const __restrict right_cv,
+        const uint32_t* const __restrict key_words,
+        uint32_t* const __restrict out_cv)
 {
   parent_cv(left_cv, right_cv, key_words, ROOT, out_cv);
 }
@@ -428,22 +366,21 @@ hash(sycl::queue& q,
   assert((chunk_count & (chunk_count - 1)) == 0); // ensure power of 2
 
   const size_t mem_size = static_cast<size_t>(BLOCK_LEN) * chunk_count;
-  sycl::uint* mem = static_cast<sycl::uint*>(sycl::malloc_device(mem_size, q));
+  uint32_t* mem = static_cast<uint32_t*>(sycl::malloc_device(mem_size, q));
 
   sycl::event evt =
     q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
       [[intel::fpga_register]] const size_t mem_offset =
         (OUT_LEN >> 2) * chunk_count;
 
-      // compress all chunks so that each chunk produces a single output
-      // chaining value of 32 -bytes, which are to be later used for
-      // computing parent chaining values ( like Binary Merklization )
+    // compress all chunks so that each chunk produces a single output
+    // chaining value of 32 -bytes, which are to be later used for
+    // computing parent chaining values ( like Binary Merklization )
 #pragma unroll 4
-      [[intel::ivdep]]
-      for (size_t i = 0; i < chunk_count; i++)
+      [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
       {
         chunkify(IV,
-                 static_cast<sycl::ulong>(i),
+                 static_cast<uint64_t>(i),
                  0,
                  input + i * CHUNK_LEN,
                  mem + mem_offset + i * (OUT_LEN >> 2));
@@ -467,16 +404,15 @@ hash(sycl::queue& q,
         [[intel::fpga_register]] const size_t parent_count =
           chunk_count >> (r + 1);
 
-        // computing output chaining values of all children nodes of
-        // some level of BlAKE3 binary merkle tree
-        // can occur in parallel, no data dependency !
-        //
-        // but ensure that following loop completes execution for (r = 0, see
-        // above) before r = 1's body execution can begin, due to presence of
-        // critical data dependency !
+      // computing output chaining values of all children nodes of
+      // some level of BlAKE3 binary merkle tree
+      // can occur in parallel, no data dependency !
+      //
+      // but ensure that following loop completes execution for (r = 0, see
+      // above) before r = 1's body execution can begin, due to presence of
+      // critical data dependency !
 #pragma unroll 2
-        [[intel::ivdep]]
-        for (size_t i = 0; i < parent_count; i++)
+        [[intel::ivdep]] for (size_t i = 0; i < parent_count; i++)
         {
           parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
                     mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
