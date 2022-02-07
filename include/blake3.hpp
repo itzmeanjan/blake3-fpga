@@ -131,23 +131,12 @@ permute(uint32_t* const msg_words)
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1641-L1703
 static inline void
-compress(const uint32_t* in_cv,
+compress(uint32_t* const __restrict state, // hash state
          uint32_t* const __restrict msg_words,
          const uint64_t counter,
          const uint32_t block_len,
-         const uint32_t flags,
-         uint32_t* const __restrict out_cv)
+         const uint32_t flags)
 {
-  // initial hash state, which will consume all sixteen message words ( = 64
-  // -bytes total ) and produce output chaining value of this message block
-  [[intel::fpga_memory("MLAB")]] uint32_t state[16];
-
-  // --- initialising hash state, begins ---
-#pragma unroll 8
-  for (size_t i = 0; i < 8; i++) {
-    state[i] = in_cv[i];
-  }
-
 #pragma unroll 4
   for (size_t i = 0; i < 4; i++) {
     state[8 + i] = IV[i];
@@ -187,12 +176,11 @@ compress(const uint32_t* in_cv,
   rnd(state, msg_words);
   // no need to permute message words anymore !
 
-  // output chaining value of this block to be used as
-  // input chaining value for next block in same chunk
-  //
+  // computing output chaining value of message block
+  // and keeping it in first 8 message words of hash state
 #pragma unroll 8 // fully parallelize loop, not data dependency
   for (size_t i = 0; i < 8; i++) {
-    out_cv[i] = state[i] ^ state[i + 8];
+    state[i] ^= state[i + 8];
     // notice I'm skipping
     // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
     // because that statement doesn't dictate what output chaining value of this
@@ -254,53 +242,25 @@ words_to_le_bytes(const uint32_t* const __restrict msg_words,
 //
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1790-L1842
-void
-chunkify(const uint32_t* const __restrict key_words,
-         const uint64_t chunk_counter,
-         const uint32_t flags,
-         const sycl::uchar* const __restrict input,
-         uint32_t* const __restrict out_cv)
+static inline void
+chunkify(const uint64_t chunk_counter,
+         uint32_t* const __restrict state,     // hash state
+         uint32_t* const __restrict msg_blocks // message words to be compressed
+)
 {
-  [[intel::fpga_memory]] uint32_t in_cv[8];
-  [[intel::fpga_memory]] uint32_t priv_out_cv[8];
-  [[intel::fpga_memory]] uint32_t msg_words[16];
-
-#pragma unroll 8 // attempt to fully parallelize array initialization !
+  // initialise hash state for first message block of chunk
+#pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
-    in_cv[i] = key_words[i];
+    state[i] = IV[i];
   }
 
-  // --- begin processing first message block ---
-  words_from_le_bytes(input, msg_words);
-  compress(in_cv,
-           msg_words,
-           chunk_counter,
-           BLOCK_LEN,
-           flags | CHUNK_START,
-           priv_out_cv);
+  compress(state, msg_blocks, chunk_counter, BLOCK_LEN, CHUNK_START);
 
-#pragma unroll 8 // copying between array can be fully parallelized !
-  for (size_t j = 0; j < 8; j++) {
-    in_cv[j] = priv_out_cv[j];
-  }
-  // --- end processing first message block ---
-
-  // process intermediate ( read non-boundary ) 14 message blocks
-  for (size_t i = 1; i < 15; i++) {
-    words_from_le_bytes(input + i * BLOCK_LEN, msg_words);
-    compress(in_cv, msg_words, chunk_counter, BLOCK_LEN, flags, priv_out_cv);
-
-#pragma unroll 8 // copying between array can be fully parallelized !
-    for (size_t j = 0; j < 8; j++) {
-      in_cv[j] = priv_out_cv[j];
-    }
+  for (size_t j = 1; j < 15; j++) {
+    compress(state, msg_blocks + (j << 4), chunk_counter, BLOCK_LEN, 0);
   }
 
-  // --- begin processing last message block ---
-  words_from_le_bytes(input + 15 * BLOCK_LEN, msg_words);
-  compress(
-    in_cv, msg_words, chunk_counter, BLOCK_LEN, flags | CHUNK_END, out_cv);
-  // --- end processing last message block ---
+  compress(state, msg_blocks + (15 << 4), chunk_counter, BLOCK_LEN, CHUNK_END);
 }
 
 // Computes chaining value for some parent ( intermediate, but non-root ) node
@@ -309,21 +269,28 @@ chunkify(const uint32_t* const __restrict key_words,
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1844-L1865
 static inline void
-parent_cv(const uint32_t* const __restrict left_cv,
+parent_cv(uint32_t* const __restrict state, // hash state
+          uint32_t* const __restrict msg_words,
+          const uint32_t* const __restrict left_cv,
           const uint32_t* const __restrict right_cv,
-          const uint32_t* const __restrict key_words,
-          const uint32_t flags,
-          uint32_t* const __restrict out_cv)
+          const uint32_t flags)
 {
-  [[intel::fpga_memory("BLOCK_RAM")]] uint32_t block_words[16];
+#pragma unroll 8
+  for (size_t i = 0; i < 8; i++) {
+    // setting first 8 message words of hash state
+    state[i] = IV[i];
+  }
 
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
-    block_words[i] = left_cv[i];
-    block_words[i + 8] = right_cv[i];
+    // setting total of 16 message words of
+    // input message to be consumed into hash state
+    // by following invocation of compress function
+    msg_words[i] = left_cv[i];
+    msg_words[i + 8] = right_cv[i];
   }
 
-  compress(key_words, block_words, 0, BLOCK_LEN, flags | PARENT, out_cv);
+  compress(state, msg_words, 0, BLOCK_LEN, flags | PARENT);
 }
 
 // Computes BLAKE3 merkle tree's root chaining value ( 32 -bytes ) by
@@ -335,12 +302,12 @@ parent_cv(const uint32_t* const __restrict left_cv,
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1867-L1874
 static inline void
-root_cv(const uint32_t* const __restrict left_cv,
-        const uint32_t* const __restrict right_cv,
-        const uint32_t* const __restrict key_words,
-        uint32_t* const __restrict out_cv)
+root_cv(uint32_t* const __restrict state, // hash state
+        uint32_t* const __restrict msg_words,
+        const uint32_t* const __restrict left_cv,
+        const uint32_t* const __restrict right_cv)
 {
-  parent_cv(left_cv, right_cv, key_words, ROOT, out_cv);
+  parent_cv(state, msg_words, left_cv, right_cv, ROOT);
 }
 
 // BLAKE3 hash function, can be used when chunk count is power of 2
@@ -370,66 +337,90 @@ hash(sycl::queue& q,
 
   sycl::event evt =
     q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
-      [[intel::fpga_register]] const size_t mem_offset =
-        (OUT_LEN >> 2) * chunk_count;
-
-    // compress all chunks so that each chunk produces a single output
-    // chaining value of 32 -bytes, which are to be later used for
-    // computing parent chaining values ( like Binary Merklization )
-#pragma unroll 4
-      [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
       {
-        chunkify(IV,
-                 static_cast<uint64_t>(i),
-                 0,
-                 input + i * CHUNK_LEN,
-                 mem + mem_offset + i * (OUT_LEN >> 2));
-      }
+        [[intel::fpga_register]] const size_t mem_offset =
+          (OUT_LEN >> 2) * chunk_count;
 
-      // `chunk_count` -many leaf nodes of BLAKE3's internal binary merkle tree
-      // to be merged in `rounds` -many dispatch rounds such that we reach
-      // root node ( i.e. chaining value ) level of merkle tree
-      [[intel::fpga_register]] const size_t rounds =
-        static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
+        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
+        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_blocks[256];
 
-      // process each level of nodes of BLAKE3's internal binary merkle tree
-      // in order
-      //
-      // as round 0 must complete before round 1 can begin, I can't let compiler
-      // coalesce following nested loop construction
-      [[intel::loop_coalesce(1)]] for (size_t r = 0; r < rounds; r++)
-      {
-        [[intel::fpga_register]] const size_t read_offset = mem_offset >> r;
-        [[intel::fpga_register]] const size_t write_offset = read_offset >> 1;
-        [[intel::fpga_register]] const size_t parent_count =
-          chunk_count >> (r + 1);
-
-      // computing output chaining values of all children nodes of
-      // some level of BlAKE3 binary merkle tree
-      // can occur in parallel, no data dependency !
-      //
-      // but ensure that following loop completes execution for (r = 0, see
-      // above) before r = 1's body execution can begin, due to presence of
-      // critical data dependency !
-#pragma unroll 2
-        [[intel::ivdep]] for (size_t i = 0; i < parent_count; i++)
+        // compress all chunks so that each chunk produces a single output
+        // chaining value of 32 -bytes, which are to be later used for
+        // computing parent chaining values ( i.e. Binary Merklization, see 👇 )
+        [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
         {
-          parent_cv(mem + read_offset + (i << 1) * (OUT_LEN >> 2),
-                    mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
-                    IV,
-                    0,
-                    mem + write_offset + i * (OUT_LEN >> 2));
+#pragma unroll 16
+          for (size_t j = 0; j < 256; j++) {
+            msg_blocks[j] = word_from_le_bytes(input + (i << 10) + (j << 2));
+          }
+
+          chunkify(static_cast<uint64_t>(i), state, msg_blocks);
+
+#pragma unroll 8
+          for (size_t j = 0; j < 8; j++) {
+            mem[mem_offset + (i << 3) + j] = state[j];
+          }
         }
       }
 
+      {
+        // `chunk_count` -many leaf nodes of BLAKE3's internal binary merkle
+        // tree to be merged in `rounds` -many dispatch rounds such that we
+        // reach root node ( i.e. chaining value ) level of merkle tree
+        [[intel::fpga_register]] const size_t rounds =
+          static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
+
+        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
+        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words[16];
+        [[intel::fpga_register]] size_t read_offset;
+        [[intel::fpga_register]] size_t write_offset;
+        [[intel::fpga_register]] size_t parent_count;
+
+        // process each level of nodes of BLAKE3's internal binary merkle tree
+        // in order
+        //
+        // as round 0 must complete before round 1 can begin, I can't let
+        // compiler coalesce following nested loop construction
+        for (size_t r = 0; r < rounds; r++) {
+          read_offset = ((OUT_LEN >> 2) * chunk_count) >> r;
+          write_offset = read_offset >> 1;
+          parent_count = chunk_count >> (r + 1);
+
+          // computing output chaining values of all children nodes of
+          // some level of BlAKE3 binary merkle tree
+          // can occur in parallel, no data dependency !
+          //
+          // but ensure that following loop completes execution for (r = 0, see
+          // above) before r = 1's body execution can begin, due to presence of
+          // critical data dependency !
+          [[intel::ivdep]] for (size_t i = 0; i < parent_count; i++)
+          {
+            parent_cv(state,
+                      msg_words,
+                      mem + read_offset + (i << 1) * (OUT_LEN >> 2),
+                      mem + read_offset + ((i << 1) + 1) * (OUT_LEN >> 2),
+                      0);
+
+#pragma unroll 8
+            for (size_t j = 0; j < 8; j++) {
+              mem[write_offset + i * (OUT_LEN >> 2) + j] = state[j];
+            }
+          }
+        }
+      }
+
+      [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
+      [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words[16];
+
       // finally compute root chaining value ( which is digest ) of BLAKE3
       // merkle tree
-      root_cv(mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
-              mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2),
-              IV,
-              mem + 1 * (OUT_LEN >> 2));
+      root_cv(state,
+              msg_words,
+              mem + ((OUT_LEN >> 2) << 1) + 0 * (OUT_LEN >> 2),
+              mem + ((OUT_LEN >> 2) << 1) + 1 * (OUT_LEN >> 2));
+
       // write 32 -bytes BLAKE3 digest back to allocated memory !
-      words_to_le_bytes(mem + 1 * (OUT_LEN >> 2), digest);
+      words_to_le_bytes(state, digest);
     });
 
   evt.wait();
