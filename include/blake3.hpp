@@ -342,17 +342,17 @@ hash(sycl::queue& q,
   sycl::event evt =
     q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
       {
-        [[intel::fpga_register]] const size_t mem_offset =
-          (OUT_LEN >> 2) * chunk_count;
-
-        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
-        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_blocks[256];
-
         // compress all chunks so that each chunk produces a single output
         // chaining value of 32 -bytes, which are to be later used for
         // computing parent chaining values ( i.e. Binary Merklization, see 👇 )
         [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
         {
+          [[intel::fpga_register]] const size_t mem_offset =
+            (OUT_LEN >> 2) * chunk_count;
+
+          [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
+          [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_blocks[256];
+
 #pragma unroll 16
           for (size_t j = 0; j < 256; j++) {
             msg_blocks[j] = word_from_le_bytes(input + (i << 10) + (j << 2));
@@ -374,21 +374,14 @@ hash(sycl::queue& q,
         [[intel::fpga_register]] const size_t rounds =
           static_cast<size_t>(sycl::log2(static_cast<double>(chunk_count))) - 1;
 
-        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
-        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words[16];
-        [[intel::fpga_register]] size_t read_offset;
-        [[intel::fpga_register]] size_t write_offset;
-        [[intel::fpga_register]] size_t parent_count;
-
         // process each level of nodes of BLAKE3's internal binary merkle tree
         // in order
         //
         // as round 0 must complete before round 1 can begin, I can't let
         // compiler coalesce following nested loop construction
         for (size_t r = 0; r < rounds; r++) {
-          read_offset = (chunk_count << 3) >> r;
-          write_offset = read_offset >> 1;
-          parent_count = chunk_count >> (r + 1);
+          [[intel::fpga_register]] const size_t parent_count =
+            chunk_count >> (r + 1);
 
           // computing output chaining values of all children nodes of
           // some level of BlAKE3 binary merkle tree
@@ -399,6 +392,14 @@ hash(sycl::queue& q,
           // critical data dependency !
           [[intel::ivdep]] for (size_t i = 0; i < parent_count; i++)
           {
+            [[intel::fpga_register]] const size_t read_offset =
+              (chunk_count << 3) >> r;
+            [[intel::fpga_register]] const size_t write_offset =
+              read_offset >> 1;
+
+            [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
+            [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words[16];
+
             parent_cv(state,
                       msg_words,
                       mem + read_offset + ((i << 1) << 3),
