@@ -454,7 +454,16 @@ hash(sycl::queue& q,                       // SYCL compute queue
   q.ext_oneapi_submit_barrier({ evt0, evt1 }).wait();
   sycl::free(mem, q);
 
+  // calculate kernel execution time ( in nanoseconds ), as mean execution
+  // time of two concurrently execution kernels, which communicate over message
+  // passing pipe interface
   if (ts != nullptr) {
+    sycl::cl_ulong ts_ = 0;
+
+    ts_ += time_event(evt0);
+    ts_ += time_event(evt1);
+
+    *ts = ts_ / 2;
   }
 }
 }
