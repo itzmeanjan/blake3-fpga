@@ -299,10 +299,10 @@ hash(sycl::queue& q,                       // SYCL compute queue
     // mem_idx ∈ [0, log2(N)] | N = chunk_count
     [[intel::fpga_register]] size_t mem_idx = 0ul;
     // temporary storage for output input/ output chaining values
-    [[intel::fpga_memory("BLOCK_RAM")]] uint32_t cv[8];
+    [[intel::fpga_memory]] uint32_t cv[8];
     // temporary storage for input message words ( = 64 -bytes ),
     // so that burst coalesced 512 -bit access can be performed from memory
-    [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg[16];
+    [[intel::fpga_memory]] uint32_t msg[16];
 
     for (size_t i = 0; i < chunk_count; i++) {
       // for each chunk, first message block ( = 64 -bytes )
@@ -428,8 +428,8 @@ hash(sycl::queue& q,                       // SYCL compute queue
     [[intel::fpga_register]] const size_t rounds =
       (chunk_count << 4) + (chunk_count - 1ul);
 
-    [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state[16];
-    [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg[16];
+    [[intel::fpga_memory]] uint32_t state[16];
+    [[intel::fpga_memory]] uint32_t msg[16];
 
     for (size_t i = 0; i < rounds; i++) {
       // get initial hash state ( 64 -bytes ) and input message words
