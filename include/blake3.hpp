@@ -363,85 +363,75 @@ hash(sycl::queue& q,                       // SYCL compute queue
     sycl::device_ptr<uint32_t> mem_ptr = sycl::device_ptr<uint32_t>(mem);
     sycl::device_ptr<sycl::uchar> o_ptr = sycl::device_ptr<sycl::uchar>(digest);
 
-    // compress all chunks so that each chunk produces a single output
-    // chaining value of 32 -bytes, which are to be later used for
-    // computing parent chaining values ( i.e. Binary Merklization, see 👇 )
-    [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i += 1)
     {
       [[intel::fpga_register]] const size_t mem_offset = chunk_count << 3;
 
       [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state_0[16];
-      // [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state_1[16];
       [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_blocks_0[256];
-      // [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_blocks_1[256];
 
-#pragma unroll 16
-      for (size_t j = 0; j < 256; j++) {
-        msg_blocks_0[j] = word_from_le_bytes(i_ptr + (i << 10) + (j << 2));
-        // msg_blocks_1[j] =
-        // word_from_le_bytes(input + ((i + 1) << 10) + (j << 2));
-      }
-
-      chunkify(static_cast<uint64_t>(i),
-               sycl::private_ptr<uint32_t>(state_0),
-               sycl::private_ptr<uint32_t>(msg_blocks_0));
-      // chunkify(static_cast<uint64_t>(i + 1), state_1, msg_blocks_1);
-
-#pragma unroll 8
-      for (size_t j = 0; j < 8; j++) {
-        mem_ptr[mem_offset + (i << 3) + j] = state_0[j];
-        // mem[mem_offset + ((i + 1) << 3) + j] = state_1[j];
-      }
-    }
-
-    // `chunk_count` -many leaf nodes of BLAKE3's internal binary merkle
-    // tree to be merged in `rounds` -many dispatch rounds such that we
-    // reach root node ( i.e. chaining value ) level of merkle tree
-    [[intel::fpga_register]] const size_t rounds = bin_log(chunk_count) - 1ul;
-
-    // process each level of nodes of BLAKE3's internal binary merkle tree
-    // in order
-    //
-    // as round 0 must complete before round 1 can begin, I can't let
-    // compiler coalesce following nested loop construction
-    for (size_t r = 0; r < rounds; r++) {
-      [[intel::fpga_register]] const size_t parent_count =
-        chunk_count >> (r + 1);
-
-      // computing output chaining values of all children nodes of
-      // some level of BlAKE3 binary merkle tree
-      // can occur in parallel, no data dependency !
-      //
-      // but ensure that following loop completes execution for (r = 0, see
-      // above) before r = 1's body execution can begin, due to presence of
-      // critical data dependency !
-      [[intel::ivdep]] for (size_t i = 0; i < parent_count; i += 1)
+      // compress all chunks so that each chunk produces a single output
+      // chaining value of 32 -bytes, which are to be later used for
+      // computing parent chaining values ( i.e. Binary Merklization, see 👇 )
+      [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i++)
       {
-        [[intel::fpga_register]] const size_t read_offset =
-          (chunk_count << 3) >> r;
-        [[intel::fpga_register]] const size_t write_offset = read_offset >> 1;
+#pragma unroll 16
+        for (size_t j = 0; j < 256; j++) {
+          msg_blocks_0[j] = word_from_le_bytes(i_ptr + (i << 10) + (j << 2));
+        }
 
-        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state_2[16];
-        // [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state_3[16];
-        [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words_0[16];
-        // [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words_1[16];
-
-        parent_cv(sycl::private_ptr<uint32_t>(state_2),
-                  sycl::private_ptr<uint32_t>(msg_words_0),
-                  mem_ptr + read_offset + ((i << 1) << 3),
-                  mem_ptr + read_offset + (((i << 1) + 1) << 3),
-                  0);
-
-        // parent_cv(state_3,
-        //           msg_words_1,
-        //           mem + read_offset + (((i + 1) << 1) << 3),
-        //           mem + read_offset + ((((i + 1) << 1) + 1) << 3),
-        //           0);
+        chunkify(static_cast<uint64_t>(i),
+                 sycl::private_ptr<uint32_t>(state_0),
+                 sycl::private_ptr<uint32_t>(msg_blocks_0));
 
 #pragma unroll 8
         for (size_t j = 0; j < 8; j++) {
-          mem_ptr[write_offset + (i << 3) + j] = state_2[j];
-          // mem[write_offset + ((i + 1) << 3) + j] = state_3[j];
+          mem_ptr[mem_offset + (i << 3) + j] = state_0[j];
+        }
+      }
+    }
+
+    {
+      // `chunk_count` -many leaf nodes of BLAKE3's internal binary merkle
+      // tree to be merged in `rounds` -many dispatch rounds such that we
+      // reach root node ( i.e. chaining value ) level of merkle tree
+      [[intel::fpga_register]] const size_t rounds = bin_log(chunk_count) - 1ul;
+
+      [[intel::fpga_register]] size_t parent_count;
+      [[intel::fpga_register]] size_t read_offset;
+      [[intel::fpga_register]] size_t write_offset;
+
+      [[intel::fpga_memory("BLOCK_RAM")]] uint32_t state_2[16];
+      [[intel::fpga_memory("BLOCK_RAM")]] uint32_t msg_words_0[16];
+
+      // process each level of nodes of BLAKE3's internal binary merkle tree
+      // in order
+      //
+      // as round 0 must complete before round 1 can begin, I can't let
+      // compiler coalesce following nested loop construction
+      for (size_t r = 0; r < rounds; r++) {
+        parent_count = chunk_count >> (r + 1);
+        read_offset = (chunk_count << 3) >> r;
+        write_offset = read_offset >> 1;
+
+        // computing output chaining values of all children nodes of
+        // some level of BlAKE3 binary merkle tree
+        // can occur in parallel, no data dependency !
+        //
+        // but ensure that following loop completes execution for (r = 0, see
+        // above) before r = 1's body execution can begin, due to presence of
+        // critical data dependency !
+        [[intel::ivdep]] for (size_t i = 0; i < parent_count; i += 1)
+        {
+          parent_cv(sycl::private_ptr<uint32_t>(state_2),
+                    sycl::private_ptr<uint32_t>(msg_words_0),
+                    mem_ptr + read_offset + ((i << 1) << 3),
+                    mem_ptr + read_offset + (((i << 1) + 1) << 3),
+                    0);
+
+#pragma unroll 8
+          for (size_t j = 0; j < 8; j++) {
+            mem_ptr[write_offset + (i << 3) + j] = state_2[j];
+          }
         }
       }
     }
