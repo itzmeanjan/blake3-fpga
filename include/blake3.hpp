@@ -1,4 +1,5 @@
 #pragma once
+#define SYCL_SIMPLE_SWIZZLES 1
 #include "common.hpp"
 #include <cassert>
 #include <sycl/ext/intel/fpga_extensions.hpp>
@@ -31,6 +32,12 @@ constexpr uint32_t CHUNK_END = 1 << 1;
 constexpr uint32_t PARENT = 1 << 2;
 constexpr uint32_t ROOT = 1 << 3;
 
+// Blake3 state vector rotation factors, during application of 7 blake3 rounds
+constexpr sycl::uint4 rrot_16 = sycl::uint4(16); // = 32 - 16
+constexpr sycl::uint4 rrot_12 = sycl::uint4(20); // = 32 - 12
+constexpr sycl::uint4 rrot_8 = sycl::uint4(24);  // = 32 - 8
+constexpr sycl::uint4 rrot_7 = sycl::uint4(25);  // = 32 - 7
+
 // Pipe to be used for sending initial hash state of 64 -bytes to compressor
 // kernel from orchestrator kernel
 using i_pipe0 = sycl::ext::intel::pipe<class HashStatePipe, uint32_t, 32>;
@@ -41,69 +48,48 @@ using i_pipe1 = sycl::ext::intel::pipe<class MessageWordsPipe, uint32_t, 32>;
 // compression, from compressor to orchestrator kernel
 using o_pipe0 = sycl::ext::intel::pipe<class ChainingValuePipe, uint32_t, 16>;
 
-// Compile time check for template function argument; checks whether
-// requested rotation bit positions for message word ( = 32 -bit )
-// is in range [0, 32)
-static constexpr bool
-valid_bit_pos(size_t bit_pos)
-{
-  return bit_pos >= 0 && bit_pos < 32;
-}
-
-// Rotates ( read circular right shift ) 32 -bit wide BLAKE3 message word
-// rightwards, by N -bit places ( note 0 <= N < 32 ), where N must
-// be compile time constant !
-template<size_t bit_pos>
-static inline const uint32_t
-rotr(uint32_t word) requires(valid_bit_pos(bit_pos))
-{
-  return (word >> bit_pos) | (word << (32 - bit_pos));
-}
-
-// Mixes two message words into 64 -bytes wide state either column-wise/
-// diagonally
-//
-// See
-// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L42-L52
-static inline void
-g(sycl::private_ptr<uint32_t> state,
-  const size_t a,
-  const size_t b,
-  const size_t c,
-  const size_t d,
-  const uint32_t mx,
-  const uint32_t my)
-{
-  state[a] = state[a] + state[b] + mx;
-  state[d] = rotr<16>(state[d] ^ state[a]);
-  state[c] = state[c] + state[d];
-  state[b] = rotr<12>(state[b] ^ state[c]);
-
-  state[a] = state[a] + state[b] + my;
-  state[d] = rotr<8>(state[d] ^ state[a]);
-  state[c] = state[c] + state[d];
-  state[b] = rotr<7>(state[b] ^ state[c]);
-}
-
 // BLAKE3 round, applied 7 times for mixing sixteen message words ( = total 64
 // -bytes ) into hash state, both column-wise and diagonally !
 //
 // See
 // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L54-L65
 static inline void
-rnd(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
+rnd(sycl::private_ptr<sycl::uint4> state, sycl::private_ptr<uint32_t> msg)
 {
-  // Mixing first eight message words of block into state column-wise
-  g(state, 0, 4, 8, 12, msg[0], msg[1]);
-  g(state, 1, 5, 9, 13, msg[2], msg[3]);
-  g(state, 2, 6, 10, 14, msg[4], msg[5]);
-  g(state, 3, 7, 11, 15, msg[6], msg[7]);
+  const sycl::uint4 mx = sycl::uint4(msg[0], msg[2], msg[4], msg[6]);
+  const sycl::uint4 my = sycl::uint4(msg[1], msg[3], msg[5], msg[6]);
+  const sycl::uint4 mz = sycl::uint4(msg[8], msg[10], msg[12], msg[14]);
+  const sycl::uint4 mw = sycl::uint4(msg[9], msg[11], msg[13], msg[15]);
 
-  // Mixing last eight message words of block into state diagonally
-  g(state, 0, 5, 10, 15, msg[8], msg[9]);
-  g(state, 1, 6, 11, 12, msg[10], msg[11]);
-  g(state, 2, 7, 8, 13, msg[12], msg[13]);
-  g(state, 3, 4, 9, 14, msg[14], msg[15]);
+  // column-wise mixing
+  state[0] = state[0] + state[1] + mx;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_16);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_12);
+  state[0] = state[0] + state[1] + my;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_8);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_7);
+
+  // diagonalize
+  state[1] = state[1].yzwx();
+  state[2] = state[2].zwxy();
+  state[3] = state[3].wxyz();
+
+  // diagonal mixing
+  state[0] = state[0] + state[1] + mz;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_16);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_12);
+  state[0] = state[0] + state[1] + mw;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_8);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_7);
+
+  // un-diagonalize
+  state[1] = state[1].wxyz();
+  state[2] = state[2].zwxy();
+  state[3] = state[3].yzwx();
 }
 
 // Permute sixteen BLAKE3 message words of each 64 -bytes wide block, after
@@ -148,7 +134,7 @@ permute(sycl::private_ptr<uint32_t> msg_words)
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1641-L1703
 static inline void
-compress(sycl::private_ptr<uint32_t> state,    // hash state
+compress(sycl::private_ptr<sycl::uint4> state, // hash state
          sycl::private_ptr<uint32_t> msg_words // input message
 )
 {
@@ -182,16 +168,14 @@ compress(sycl::private_ptr<uint32_t> state,    // hash state
 
   // computing output chaining value of message block
   // and keeping it over first 8 words of hash state
-#pragma unroll 8 // fully parallelize loop, not data dependency
-  for (size_t i = 0; i < 8; i++) {
-    state[i & 0x7] ^= state[(i + 8ul) & 0xf];
-    // notice I'm skipping
-    // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
-    // because that statement doesn't dictate what output chaining value of this
-    // message block will be !
-    //
-    // So it's safe to do so !
-  }
+  state[0] ^= state[2];
+  state[1] ^= state[3];
+  // notice I'm skipping
+  // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
+  // because that statement doesn't dictate what output chaining value of this
+  // message block will be !
+  //
+  // So it's safe to do so !
 }
 
 // Four consecutive little endian bytes are interpreted as 32 -bit unsigned
@@ -276,7 +260,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
     sycl::device_ptr<uint32_t> mem_ptr = sycl::device_ptr<uint32_t>(mem);
     sycl::device_ptr<sycl::uchar> o_ptr = sycl::device_ptr<sycl::uchar>(digest);
 
-    // mem_idx ∈ [0, N] | N = chunk count
+    // mem_idx ∈ [0, N) | N = chunk count
     [[intel::fpga_register]] size_t mem_idx = 0ul;
 
     // temporary storage for input/ output chaining values;
@@ -612,7 +596,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
     [[intel::fpga_memory("BLOCK_RAM"),
       intel::numbanks(16),
-      intel::bankwidth(4)]] uint32_t state[16];
+      intel::bankwidth(4)]] sycl::uint4 state[4];
     [[intel::fpga_memory("BLOCK_RAM"),
       intel::numbanks(16),
       intel::bankwidth(4)]] uint32_t msg[16];
@@ -620,22 +604,39 @@ hash(sycl::queue& q,                       // SYCL compute queue
     for (size_t i = 0; i < rounds; i++) {
       // get initial hash state ( 64 -bytes ) and input message words
       // ( 64 -bytes ) from orchestrator kernel
-      [[intel::ivdep]] for (size_t j = 0; j < 16; j++)
+
+      [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
       {
-        state[j & 0xf] = i_pipe0::read();
-        msg[j & 0xf] = i_pipe1::read();
+        uint32_t a = i_pipe0::read();
+        msg[((j << 2) + 0ul) & 0xf] = i_pipe1::read();
+
+        uint32_t b = i_pipe0::read();
+        msg[((j << 2) + 1ul) & 0xf] = i_pipe1::read();
+
+        uint32_t c = i_pipe0::read();
+        msg[((j << 2) + 2ul) & 0xf] = i_pipe1::read();
+
+        uint32_t d = i_pipe0::read();
+        msg[((j << 2) + 3ul) & 0xf] = i_pipe1::read();
+
+        state[j & 0x3] = sycl::uint4(a, b, c, d);
       }
 
       // compress sixteen message words into hash state, output chaining value
-      // lives on first 8 words of hash state
+      // lives on first 8 words of hash state ( i.e. on first two 128 -bit
+      // vectors )
       compress(state, msg);
 
       // finally send 8 word output chaining value, as result of compression,
       // to orchestrator kernel
-      [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
-      {
-        o_pipe0::write(state[j & 0x7]);
-      }
+      o_pipe0::write(state[0][0]);
+      o_pipe0::write(state[0][1]);
+      o_pipe0::write(state[0][2]);
+      o_pipe0::write(state[0][3]);
+      o_pipe0::write(state[1][0]);
+      o_pipe0::write(state[1][1]);
+      o_pipe0::write(state[1][2]);
+      o_pipe0::write(state[1][3]);
     }
   });
 
