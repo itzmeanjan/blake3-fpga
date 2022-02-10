@@ -33,13 +33,13 @@ constexpr uint32_t ROOT = 1 << 3;
 
 // Pipe to be used for sending initial hash state of 64 -bytes to compressor
 // kernel from orchestrator kernel
-using i_pipe0 = sycl::ext::intel::pipe<class HashStatePipe, uint32_t, 16>;
+using i_pipe0 = sycl::ext::intel::pipe<class HashStatePipe, uint32_t, 32>;
 // Pipe to be used for sending ( total ) 64 -bytes message words to compressor
 // kernel from orchestrator kernel
-using i_pipe1 = sycl::ext::intel::pipe<class MessageWordsPipe, uint32_t, 16>;
+using i_pipe1 = sycl::ext::intel::pipe<class MessageWordsPipe, uint32_t, 32>;
 // Pipe to be used for sending 32 -bytes output chaining value as result of
 // compression, from compressor to orchestrator kernel
-using o_pipe0 = sycl::ext::intel::pipe<class ChainingValuePipe, uint32_t, 8>;
+using o_pipe0 = sycl::ext::intel::pipe<class ChainingValuePipe, uint32_t, 16>;
 
 // Compile time check for template function argument; checks whether
 // requested rotation bit positions for message word ( = 32 -bit )
@@ -122,16 +122,18 @@ permute(sycl::private_ptr<uint32_t> msg_words)
   // permutation
   //
   // probably going to be optimized such that it's not synthesized !
-  [[intel::fpga_memory("BLOCK_RAM")]] uint32_t permuted[16];
+  [[intel::fpga_memory("BLOCK_RAM"),
+    intel::numbanks(16),
+    intel::bankwidth(4)]] uint32_t permuted[16];
 
 #pragma unroll 16
   for (size_t i = 0; i < 16; i++) {
-    permuted[i] = msg_words[MSG_PERMUTATION[i]];
+    permuted[i & 0xf] = msg_words[MSG_PERMUTATION[i & 0xf] & 0xf];
   }
 
 #pragma unroll 16
   for (size_t i = 0; i < 16; i++) {
-    msg_words[i] = permuted[i];
+    msg_words[i & 0xf] = permuted[i & 0xf];
   }
 }
 
@@ -182,7 +184,7 @@ compress(sycl::private_ptr<uint32_t> state,    // hash state
   // and keeping it over first 8 words of hash state
 #pragma unroll 8 // fully parallelize loop, not data dependency
   for (size_t i = 0; i < 8; i++) {
-    state[i] ^= state[i + 8];
+    state[i & 0x7] ^= state[(i + 8ul) & 0xf];
     // notice I'm skipping
     // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
     // because that statement doesn't dictate what output chaining value of this
@@ -216,12 +218,12 @@ word_to_le_bytes(const uint32_t word, sycl::device_ptr<sycl::uchar> output)
 // Eight consecutive BLAKE3 message words are converted to 32 little endian
 // bytes
 static inline void
-words_to_le_bytes(const sycl::device_ptr<uint32_t> msg_words,
+words_to_le_bytes(const sycl::private_ptr<uint32_t> msg_words,
                   sycl::device_ptr<sycl::uchar> output)
 {
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
-    word_to_le_bytes(msg_words[i], output + (i << 2));
+    word_to_le_bytes(msg_words[i & 0x7], output + (i << 2));
   }
 }
 
@@ -232,20 +234,6 @@ bin_log(size_t n)
   size_t cnt = 0ul;
 
   while (n > 1ul) {
-    n >>= 1;
-    cnt++;
-  }
-
-  return cnt;
-}
-
-// Computes how many trailing zero bits are present in n ( > 0 )
-static inline const size_t
-ctz(size_t n)
-{
-  size_t cnt = 0ul;
-
-  while ((n & 0b1ul) == 0ul) {
     n >>= 1;
     cnt++;
   }
@@ -276,15 +264,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
   assert(chunk_count >= (1 << 10)); // but you would probably want >= 2^20
   assert((chunk_count & (chunk_count - 1)) == 0); // ensure power of 2
 
-  // allocated on device memory, so that all those intermediate ( output )
-  // chaining values can be bufferred !
-  //
-  // Note, each output chaining value is 32 -bytes
-  //
-  // During BLAKE3 hash computation with `N` -many 1024 -bytes message
-  // chunks, at a time, maximum log2(N) -many output chaining values will
-  // be required to be bufferred !
-  const size_t mem_size = (bin_log(chunk_count) << 3) * sizeof(uint32_t);
+  const size_t mem_size = (chunk_count << 3) * sizeof(uint32_t);
   uint32_t* mem = static_cast<uint32_t*>(sycl::malloc_device(mem_size, q));
 
   sycl::event evt0 = q.single_task<kernelBlake3Orchestrator>([=
@@ -296,64 +276,87 @@ hash(sycl::queue& q,                       // SYCL compute queue
     sycl::device_ptr<uint32_t> mem_ptr = sycl::device_ptr<uint32_t>(mem);
     sycl::device_ptr<sycl::uchar> o_ptr = sycl::device_ptr<sycl::uchar>(digest);
 
-    // mem_idx ∈ [0, log2(N)] | N = chunk_count
+    // mem_idx ∈ [0, N] | N = chunk count
     [[intel::fpga_register]] size_t mem_idx = 0ul;
-    // temporary storage for output input/ output chaining values
-    [[intel::fpga_memory]] uint32_t cv[8];
+
+    // temporary storage for input/ output chaining values;
+    // used for message passing over on-chip fifo pipes
+    [[intel::fpga_memory("BLOCK_RAM"),
+      intel::numbanks(8),
+      intel::bankwidth(4)]] uint32_t cv0[8];
+    [[intel::fpga_memory("BLOCK_RAM"),
+      intel::numbanks(8),
+      intel::bankwidth(4)]] uint32_t cv1[8];
+
     // temporary storage for input message words ( = 64 -bytes ),
     // so that burst coalesced 512 -bit access can be performed from memory
-    [[intel::fpga_memory]] uint32_t msg[16];
+    [[intel::fpga_memory("BLOCK_RAM"),
+      intel::numbanks(16),
+      intel::bankwidth(4)]] uint32_t msg[16];
 
-    for (size_t i = 0; i < chunk_count; i++) {
-      // for each chunk, first message block ( = 64 -bytes )
-      // has ( same ) constant initial hash values for first 8 words
-#pragma unroll 8
+    [[intel::ivdep]] for (size_t i = 0; i < chunk_count; i += 2)
+    {
+      // first chunk being worked on
+      [[intel::fpga_register]] const size_t chunk_id0 = i;
+      // second chunk being worked on
+      //
+      // note, two chunks are living next to each other,
+      // but specific message blocks from those chunks, which are
+      // to be compressed in following statements, are *never*
+      // contiguous in memory
+      [[intel::fpga_register]] const size_t chunk_id1 = i + 1ul;
+      // computing address offset of global memory input byte array
+      // for both chunks, which are to be compressed, in following section
+      [[intel::fpga_register]] const size_t _i_ptr0 = chunk_id0 << 10;
+      [[intel::fpga_register]] const size_t _i_ptr1 = chunk_id1 << 10;
+
+      // fill input chaining values ( with predefined initial hash values ) for
+      // both chunk's first message blocks i.e. message block 0
+#pragma unroll 8 // fully parallelized, will be burst coalesced !
       for (size_t j = 0; j < 8; j++) {
-        cv[j] = IV[j];
+        cv0[j & 0x7] = IV[j & 0x7];
+        cv1[j & 0x7] = IV[j & 0x7];
       }
 
-      // each chunk ( = 1024 -bytes ), has 16 message blocks, each of 64 -bytes
-      // width, which are required to be processed sequentially
+      // each chunk has 1024 -bytes, meaning 16 rounds of compression will be
+      // required before we get to compute output chaining value of a chunk
       //
-      // To be more specific, j-th chunk's input chaining values ( = first 32
-      // -bytes ) are taken from (j-1) -th chunk's output chaining values ( 32
-      // -bytes ) | j = {1, 2, 3, ... 15}
-      //
-      // Note, for j = 0, input chaining values are already initialised in
-      // above unrolled loop !
+      // in following for loop, I'm compressing (16 + 16) message blocks
+      // from two chunks
       for (size_t j = 0; j < 16; j++) {
-        sycl::device_ptr<sycl::uchar> ptr_ = i_ptr + (i << 10) + (j << 6);
+        // to be compressed message block's beginning, for first chunk
+        sycl::device_ptr<sycl::uchar> ptr0 = i_ptr + _i_ptr0 + (j << 6);
+        // to be compressed message block's beginning, for second chunk
+        sycl::device_ptr<sycl::uchar> ptr1 = i_ptr + _i_ptr1 + (j << 6);
 
-        // in following statements, 64 -bytes input hash state & 64 -bytes input
-        // message block is passed via pipe ( to kernel which compresses message
-        // blocks and produces output chaining value of 32 -bytes ) !
+        // --- begin compressing first chunk's message block ---
 
-#pragma unroll 16
+#pragma unroll 16 // burst coalesced read of 512 -bit from global memory
         for (size_t k = 0; k < 16; k++) {
-          msg[k] = word_from_le_bytes(ptr_ + (k << 2));
+          msg[k & 0xf] = word_from_le_bytes(ptr0 + (k << 2));
         }
 
-        for (size_t k = 0; k < 8; k++) {
-          i_pipe0::write(cv[k]);
-          i_pipe1::write(msg[k]);
+        [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
+        {
+          i_pipe0::write(cv0[k & 0x7]);
+          i_pipe1::write(msg[k & 0x7]);
         }
 
-        for (size_t k = 0; k < 4; k++) {
-          i_pipe0::write(IV[k]);
-          i_pipe1::write(msg[8ul + k]);
+        [[intel::ivdep]] for (size_t k = 0; k < 4; k++)
+        {
+          i_pipe0::write(IV[k & 0x3]);
+          i_pipe1::write(msg[(8ul + k) & 0xf]);
         }
 
-        i_pipe0::write(static_cast<uint32_t>(i & 0xffffffff));
+        i_pipe0::write(static_cast<uint32_t>(chunk_id0 & 0xffffffff));
         i_pipe1::write(msg[12]);
 
-        i_pipe0::write(static_cast<uint32_t>(i >> 32));
+        i_pipe0::write(static_cast<uint32_t>(chunk_id0 >> 32));
         i_pipe1::write(msg[13]);
 
         i_pipe0::write(BLOCK_LEN);
         i_pipe1::write(msg[14]);
 
-        // ensure that proper message block denoter flags are passed
-        // before compression
         if (j == 0ul) {
           i_pipe0::write(CHUNK_START);
         } else if (j == 15ul) {
@@ -364,62 +367,241 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
         i_pipe1::write(msg[15]);
 
-        // in following statements, 32 -bytes output chaining value of
-        // compressed message block is being read !
+        // --- end compressing first chunk's message block ---
 
-        for (size_t k = 0; k < 8; k++) {
-          cv[k] = o_pipe0::read();
-        }
-      }
+        // --- begin compressing second chunk's message block ---
 
-      [[intel::fpga_register]] size_t zeros = ctz(i + 1ul);
-
-      while (zeros > 0) {
-        mem_idx--;
-
-        for (size_t j = 0; j < 8; j++) {
-          i_pipe0::write(IV[j]);
-          i_pipe1::write(mem_ptr[(mem_idx << 3) + j]);
+#pragma unroll 16 // burst coalesced read of 512 -bit from global memory
+        for (size_t k = 0; k < 16; k++) {
+          msg[k & 0xf] = word_from_le_bytes(ptr1 + (k << 2));
         }
 
-        for (size_t k = 0; k < 4; k++) {
-          i_pipe0::write(IV[k]);
-          i_pipe1::write(cv[k]);
+        [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
+        {
+          i_pipe0::write(cv1[k & 0x7]);
+          i_pipe1::write(msg[k & 0x7]);
         }
 
-        i_pipe0::write(0u);
-        i_pipe1::write(cv[4]);
+        [[intel::ivdep]] for (size_t k = 0; k < 4; k++)
+        {
+          i_pipe0::write(IV[k & 0x3]);
+          i_pipe1::write(msg[(8ul + k) & 0xf]);
+        }
 
-        i_pipe0::write(0u);
-        i_pipe1::write(cv[5]);
+        i_pipe0::write(static_cast<uint32_t>(chunk_id1 & 0xffffffff));
+        i_pipe1::write(msg[12]);
+
+        i_pipe0::write(static_cast<uint32_t>(chunk_id1 >> 32));
+        i_pipe1::write(msg[13]);
 
         i_pipe0::write(BLOCK_LEN);
-        i_pipe1::write(cv[6]);
+        i_pipe1::write(msg[14]);
 
-        if (i + 1ul == chunk_count && zeros == 1) {
-          i_pipe0::write(PARENT | ROOT);
+        if (j == 0ul) {
+          i_pipe0::write(CHUNK_START);
+        } else if (j == 15ul) {
+          i_pipe0::write(CHUNK_END);
         } else {
-          i_pipe0::write(PARENT);
+          i_pipe0::write(0);
         }
 
-        i_pipe1::write(cv[7]);
+        i_pipe1::write(msg[15]);
 
-        for (size_t j = 0; j < 8; j++) {
-          cv[j] = o_pipe0::read();
+        // --- end compressing second chunk's message block ---
+
+        // read output chaining value of first chunk's message block
+        [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
+        {
+          cv0[k & 0x7] = o_pipe0::read();
         }
-
-        zeros--;
+        // read output chaining value of second chunk's message block
+        [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
+        {
+          cv1[k & 0x7] = o_pipe0::read();
+        }
       }
 
-#pragma unroll 8
+      // two consecutive chunks are compressed, so writing their output chaining
+      // values on contiguous memory locations, of global memory
+#pragma unroll 8 // should be burst coalesced global memory write
       for (size_t j = 0; j < 8; j++) {
-        mem_ptr[(mem_idx << 3) + j] = cv[j];
+        mem_ptr[(mem_idx << 3) + j] = cv0[j & 0x7];
+        mem_ptr[((mem_idx + 1) << 3) + j] = cv1[j & 0x7];
       }
 
-      mem_idx++;
+      // move forward global memory pointer by two places,
+      // because two chunks just got compressed
+      mem_idx += 2;
     }
 
-    words_to_le_bytes(mem_ptr, o_ptr);
+    // these many intermediate levels ( parent chaining values ) of blake3
+    // merkle tree to be computed
+    //
+    // note, subtraction of 1 comes from the fact that root of merkle tree
+    // is not computed in following for loop
+    [[intel::fpga_register]] const size_t rounds = bin_log(chunk_count) - 1ul;
+
+    // sequentially compute all intermediate nodes blake3 binary merkle tree
+    // where leaf nodes ( in terms of chunks output chaining values ) are
+    // provided in global memory
+    for (size_t r = 0; r < rounds; r++) {
+      // offset in global memory, for reading four contiguous output chaining
+      // values of four nodes, living on same level of blake3 binary merkle tree
+      [[intel::fpga_register]] size_t rd_mem_idx = 0;
+      // offset in global memory, for writing two contiguous output chaining
+      // values of two nodes, living on just above of aforementioned four
+      // nodes of blake3 binary merkle tree
+      [[intel::fpga_register]] size_t wr_mem_idx = 0;
+
+      // in this level of blake3 of binary merkle tree, these many intermediate
+      // chaining values to be computed, from double many input chaining values
+      [[intel::fpga_register]] const size_t compress_c = chunk_count >> (r + 1);
+
+      // note, in each iteration, I'm compressing two intermediate nodes
+      // and producing parent node ( read chaining values )
+      [[intel::ivdep]] for (size_t c = 0; c < compress_c; c += 2)
+      {
+        // --- begin compressing first (two) intermediate node ---
+
+#pragma unroll 16 // burst coalesced 512 -bit read from global memory
+        for (size_t j = 0; j < 16; j++) {
+          msg[j & 0xf] = mem_ptr[(rd_mem_idx << 3) + j];
+        }
+
+        [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+        {
+          i_pipe0::write(IV[j & 0x7]);
+          i_pipe1::write(msg[j & 0x7]);
+        }
+
+        [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
+        {
+          i_pipe0::write(IV[j & 0x3]);
+          i_pipe1::write(msg[(8ul + j) & 0xf]);
+        }
+
+        i_pipe0::write(0u);
+        i_pipe1::write(msg[12]);
+
+        i_pipe0::write(0u);
+        i_pipe1::write(msg[13]);
+
+        i_pipe0::write(BLOCK_LEN);
+        i_pipe1::write(msg[14]);
+
+        i_pipe0::write(PARENT);
+        i_pipe1::write(msg[15]);
+
+        rd_mem_idx += 2;
+
+        // --- end compressing first (two) intermediate node ---
+
+        // --- begin compressing next (two) intermediate node ---
+
+#pragma unroll 16 // burst coalesced 512 -bit read from global memory
+        for (size_t j = 0; j < 16; j++) {
+          msg[j & 0xf] = mem_ptr[(rd_mem_idx << 3) + j];
+        }
+
+        [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+        {
+          i_pipe0::write(IV[j & 0x7]);
+          i_pipe1::write(msg[j & 0x7]);
+        }
+
+        [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
+        {
+          i_pipe0::write(IV[j & 0x3]);
+          i_pipe1::write(msg[(8ul + j) & 0xf]);
+        }
+
+        i_pipe0::write(0u);
+        i_pipe1::write(msg[12]);
+
+        i_pipe0::write(0u);
+        i_pipe1::write(msg[13]);
+
+        i_pipe0::write(BLOCK_LEN);
+        i_pipe1::write(msg[14]);
+
+        i_pipe0::write(PARENT);
+        i_pipe1::write(msg[15]);
+
+        rd_mem_idx += 2;
+
+        // --- end compressing next (two) intermediate node ---
+
+        // read output chaining values ( of first pair of compressed nodes )
+        // from fifo pipe
+        [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+        {
+          cv0[j & 0x7] = o_pipe0::read();
+        }
+
+        // then write those back to global memory
+#pragma unroll 8 // 256 -bit wide burst coalesced access
+        for (size_t j = 0; j < 8; j++) {
+          mem_ptr[(wr_mem_idx << 3) + j] = cv0[j & 0x7];
+        }
+
+        // read output chaining values ( of second pair of compressed nodes )
+        // from fifo pipe
+        [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+        {
+          cv1[j & 0x7] = o_pipe0::read();
+        }
+
+        // then write those back to global memory
+#pragma unroll 8 // 256 -bit wide burst coalesced write
+        for (size_t j = 0; j < 8; j++) {
+          mem_ptr[((wr_mem_idx + 1) << 3) + j] = cv1[j & 0x7];
+        }
+
+        wr_mem_idx += 2;
+      }
+    }
+
+    // --- begin computing root ( i.e. digest ) of blake3 binary merkle tree ---
+
+#pragma unroll 16 // 512 -bit burst coalesced read from global memory
+    for (size_t j = 0; j < 16; j++) {
+      msg[j & 0xf] = mem_ptr[j];
+    }
+
+    [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+    {
+      i_pipe0::write(IV[j & 0x7]);
+      i_pipe1::write(msg[j & 0xf]);
+    }
+
+    [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
+    {
+      i_pipe0::write(IV[j & 0x7]);
+      i_pipe1::write(msg[(8ul + j) & 0xf]);
+    }
+
+    i_pipe0::write(0u);
+    i_pipe1::write(msg[12]);
+
+    i_pipe0::write(0u);
+    i_pipe1::write(msg[13]);
+
+    i_pipe0::write(BLOCK_LEN);
+    i_pipe1::write(msg[14]);
+
+    i_pipe0::write(PARENT | ROOT);
+    i_pipe1::write(msg[15]);
+
+    [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+    {
+      cv0[j & 0x7] = o_pipe0::read();
+    }
+
+    // --- end computing root ( i.e. digest ) of blake3 binary merkle tree ---
+
+    // write digest back ( in little endian byte form ) to allocated 32 -bytes (
+    // global ) memory
+    words_to_le_bytes(sycl::private_ptr<uint32_t>(cv0), o_ptr);
   });
 
   sycl::event evt1 = q.single_task<kernelBlake3Compressor>([=
@@ -428,15 +610,20 @@ hash(sycl::queue& q,                       // SYCL compute queue
     [[intel::fpga_register]] const size_t rounds =
       (chunk_count << 4) + (chunk_count - 1ul);
 
-    [[intel::fpga_memory]] uint32_t state[16];
-    [[intel::fpga_memory]] uint32_t msg[16];
+    [[intel::fpga_memory("BLOCK_RAM"),
+      intel::numbanks(16),
+      intel::bankwidth(4)]] uint32_t state[16];
+    [[intel::fpga_memory("BLOCK_RAM"),
+      intel::numbanks(16),
+      intel::bankwidth(4)]] uint32_t msg[16];
 
     for (size_t i = 0; i < rounds; i++) {
       // get initial hash state ( 64 -bytes ) and input message words
       // ( 64 -bytes ) from orchestrator kernel
-      for (size_t j = 0; j < 16; j++) {
-        state[j] = i_pipe0::read();
-        msg[j] = i_pipe1::read();
+      [[intel::ivdep]] for (size_t j = 0; j < 16; j++)
+      {
+        state[j & 0xf] = i_pipe0::read();
+        msg[j & 0xf] = i_pipe1::read();
       }
 
       // compress sixteen message words into hash state, output chaining value
@@ -445,8 +632,9 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
       // finally send 8 word output chaining value, as result of compression,
       // to orchestrator kernel
-      for (size_t j = 0; j < 8; j++) {
-        o_pipe0::write(state[j]);
+      [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
+      {
+        o_pipe0::write(state[j & 0x7]);
       }
     }
   });
