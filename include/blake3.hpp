@@ -57,7 +57,7 @@ static inline void
 rnd(sycl::private_ptr<sycl::uint4> state, sycl::private_ptr<uint32_t> msg)
 {
   const sycl::uint4 mx = sycl::uint4(msg[0], msg[2], msg[4], msg[6]);
-  const sycl::uint4 my = sycl::uint4(msg[1], msg[3], msg[5], msg[6]);
+  const sycl::uint4 my = sycl::uint4(msg[1], msg[3], msg[5], msg[7]);
   const sycl::uint4 mz = sycl::uint4(msg[8], msg[10], msg[12], msg[14]);
   const sycl::uint4 mw = sycl::uint4(msg[9], msg[11], msg[13], msg[15]);
 
