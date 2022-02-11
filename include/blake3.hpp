@@ -38,6 +38,10 @@ constexpr sycl::uint4 rrot_12 = sycl::uint4(20); // = 32 - 12
 constexpr sycl::uint4 rrot_8 = sycl::uint4(24);  // = 32 - 8
 constexpr sycl::uint4 rrot_7 = sycl::uint4(25);  // = 32 - 7
 
+// For SYCL pipe, following design document
+// https://github.com/intel/llvm/blob/ad9ac98/sycl/doc/extensions/proposed/SYCL_EXT_INTEL_DATAFLOW_PIPES.asciidoc
+//
+//
 // Pipe to be used for sending initial hash state of 64 -bytes to compressor
 // kernel from orchestrator kernel
 using i_pipe0 = sycl::ext::intel::pipe<class HashStatePipe, uint32_t, 32>;
@@ -320,36 +324,39 @@ hash(sycl::queue& q,                       // SYCL compute queue
           msg[k & 0xf] = word_from_le_bytes(ptr0 + (k << 2));
         }
 
+        // so that non-block pipe write can be issued
+        bool success;
+
         [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
         {
-          i_pipe0::write(cv0[k & 0x7]);
-          i_pipe1::write(msg[k & 0x7]);
+          i_pipe0::write(cv0[k & 0x7], success);
+          i_pipe1::write(msg[k & 0x7], success);
         }
 
         [[intel::ivdep]] for (size_t k = 0; k < 4; k++)
         {
-          i_pipe0::write(IV[k & 0x3]);
-          i_pipe1::write(msg[(8ul + k) & 0xf]);
+          i_pipe0::write(IV[k & 0x3], success);
+          i_pipe1::write(msg[(8ul + k) & 0xf], success);
         }
 
-        i_pipe0::write(static_cast<uint32_t>(chunk_id0 & 0xffffffff));
-        i_pipe1::write(msg[12]);
+        i_pipe0::write(static_cast<uint32_t>(chunk_id0 & 0xffffffff), success);
+        i_pipe1::write(msg[12], success);
 
-        i_pipe0::write(static_cast<uint32_t>(chunk_id0 >> 32));
-        i_pipe1::write(msg[13]);
+        i_pipe0::write(static_cast<uint32_t>(chunk_id0 >> 32), success);
+        i_pipe1::write(msg[13], success);
 
-        i_pipe0::write(BLOCK_LEN);
-        i_pipe1::write(msg[14]);
+        i_pipe0::write(BLOCK_LEN, success);
+        i_pipe1::write(msg[14], success);
 
         if (j == 0ul) {
-          i_pipe0::write(CHUNK_START);
+          i_pipe0::write(CHUNK_START, success);
         } else if (j == 15ul) {
-          i_pipe0::write(CHUNK_END);
+          i_pipe0::write(CHUNK_END, success);
         } else {
-          i_pipe0::write(0);
+          i_pipe0::write(0, success);
         }
 
-        i_pipe1::write(msg[15]);
+        i_pipe1::write(msg[15], success);
 
         // --- end compressing first chunk's message block ---
 
@@ -362,45 +369,47 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
         [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
         {
-          i_pipe0::write(cv1[k & 0x7]);
-          i_pipe1::write(msg[k & 0x7]);
+          i_pipe0::write(cv1[k & 0x7], success);
+          i_pipe1::write(msg[k & 0x7], success);
         }
 
         [[intel::ivdep]] for (size_t k = 0; k < 4; k++)
         {
-          i_pipe0::write(IV[k & 0x3]);
-          i_pipe1::write(msg[(8ul + k) & 0xf]);
+          i_pipe0::write(IV[k & 0x3], success);
+          i_pipe1::write(msg[(8ul + k) & 0xf], success);
         }
 
-        i_pipe0::write(static_cast<uint32_t>(chunk_id1 & 0xffffffff));
-        i_pipe1::write(msg[12]);
+        i_pipe0::write(static_cast<uint32_t>(chunk_id1 & 0xffffffff), success);
+        i_pipe1::write(msg[12], success);
 
-        i_pipe0::write(static_cast<uint32_t>(chunk_id1 >> 32));
-        i_pipe1::write(msg[13]);
+        i_pipe0::write(static_cast<uint32_t>(chunk_id1 >> 32), success);
+        i_pipe1::write(msg[13], success);
 
-        i_pipe0::write(BLOCK_LEN);
-        i_pipe1::write(msg[14]);
+        i_pipe0::write(BLOCK_LEN, success);
+        i_pipe1::write(msg[14], success);
 
         if (j == 0ul) {
-          i_pipe0::write(CHUNK_START);
+          i_pipe0::write(CHUNK_START, success);
         } else if (j == 15ul) {
-          i_pipe0::write(CHUNK_END);
+          i_pipe0::write(CHUNK_END, success);
         } else {
-          i_pipe0::write(0);
+          i_pipe0::write(0, success);
         }
 
-        i_pipe1::write(msg[15]);
+        i_pipe1::write(msg[15], success);
 
         // --- end compressing second chunk's message block ---
 
         // read output chaining value of first chunk's message block
         [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
         {
+          // note, pipe reads are issued blocking
           cv0[k & 0x7] = o_pipe0::read();
         }
         // read output chaining value of second chunk's message block
         [[intel::ivdep]] for (size_t k = 0; k < 8; k++)
         {
+          // note, pipe reads are issued blocking
           cv1[k & 0x7] = o_pipe0::read();
         }
       }
@@ -452,29 +461,32 @@ hash(sycl::queue& q,                       // SYCL compute queue
           msg[j & 0xf] = mem_ptr[(rd_mem_idx << 3) + j];
         }
 
+        // so that non-block pipe write can be issued
+        bool success;
+
         [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
         {
-          i_pipe0::write(IV[j & 0x7]);
-          i_pipe1::write(msg[j & 0x7]);
+          i_pipe0::write(IV[j & 0x7], success);
+          i_pipe1::write(msg[j & 0x7], success);
         }
 
         [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
         {
-          i_pipe0::write(IV[j & 0x3]);
-          i_pipe1::write(msg[(8ul + j) & 0xf]);
+          i_pipe0::write(IV[j & 0x3], success);
+          i_pipe1::write(msg[(8ul + j) & 0xf], success);
         }
 
-        i_pipe0::write(0u);
-        i_pipe1::write(msg[12]);
+        i_pipe0::write(0u, success);
+        i_pipe1::write(msg[12], success);
 
-        i_pipe0::write(0u);
-        i_pipe1::write(msg[13]);
+        i_pipe0::write(0u, success);
+        i_pipe1::write(msg[13], success);
 
-        i_pipe0::write(BLOCK_LEN);
-        i_pipe1::write(msg[14]);
+        i_pipe0::write(BLOCK_LEN, success);
+        i_pipe1::write(msg[14], success);
 
-        i_pipe0::write(PARENT);
-        i_pipe1::write(msg[15]);
+        i_pipe0::write(PARENT, success);
+        i_pipe1::write(msg[15], success);
 
         rd_mem_idx += 2;
 
@@ -489,27 +501,27 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
         [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
         {
-          i_pipe0::write(IV[j & 0x7]);
-          i_pipe1::write(msg[j & 0x7]);
+          i_pipe0::write(IV[j & 0x7], success);
+          i_pipe1::write(msg[j & 0x7], success);
         }
 
         [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
         {
-          i_pipe0::write(IV[j & 0x3]);
-          i_pipe1::write(msg[(8ul + j) & 0xf]);
+          i_pipe0::write(IV[j & 0x3], success);
+          i_pipe1::write(msg[(8ul + j) & 0xf], success);
         }
 
-        i_pipe0::write(0u);
-        i_pipe1::write(msg[12]);
+        i_pipe0::write(0u, success);
+        i_pipe1::write(msg[12], success);
 
-        i_pipe0::write(0u);
-        i_pipe1::write(msg[13]);
+        i_pipe0::write(0u, success);
+        i_pipe1::write(msg[13], success);
 
-        i_pipe0::write(BLOCK_LEN);
-        i_pipe1::write(msg[14]);
+        i_pipe0::write(BLOCK_LEN, success);
+        i_pipe1::write(msg[14], success);
 
-        i_pipe0::write(PARENT);
-        i_pipe1::write(msg[15]);
+        i_pipe0::write(PARENT, success);
+        i_pipe1::write(msg[15], success);
 
         rd_mem_idx += 2;
 
@@ -519,6 +531,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
         // from fifo pipe
         [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
         {
+          // note, pipe reads are issued blocking
           cv0[j & 0x7] = o_pipe0::read();
         }
 
@@ -532,6 +545,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
         // from fifo pipe
         [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
         {
+          // note, pipe reads are issued blocking
           cv1[j & 0x7] = o_pipe0::read();
         }
 
@@ -552,32 +566,36 @@ hash(sycl::queue& q,                       // SYCL compute queue
       msg[j & 0xf] = mem_ptr[j];
     }
 
+    // so that non-block pipe write can be issued
+    bool success;
+
     [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
     {
-      i_pipe0::write(IV[j & 0x7]);
-      i_pipe1::write(msg[j & 0xf]);
+      i_pipe0::write(IV[j & 0x7], success);
+      i_pipe1::write(msg[j & 0xf], success);
     }
 
     [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
     {
-      i_pipe0::write(IV[j & 0x7]);
-      i_pipe1::write(msg[(8ul + j) & 0xf]);
+      i_pipe0::write(IV[j & 0x7], success);
+      i_pipe1::write(msg[(8ul + j) & 0xf], success);
     }
 
-    i_pipe0::write(0u);
-    i_pipe1::write(msg[12]);
+    i_pipe0::write(0u, success);
+    i_pipe1::write(msg[12], success);
 
-    i_pipe0::write(0u);
-    i_pipe1::write(msg[13]);
+    i_pipe0::write(0u, success);
+    i_pipe1::write(msg[13], success);
 
-    i_pipe0::write(BLOCK_LEN);
-    i_pipe1::write(msg[14]);
+    i_pipe0::write(BLOCK_LEN, success);
+    i_pipe1::write(msg[14], success);
 
-    i_pipe0::write(PARENT | ROOT);
-    i_pipe1::write(msg[15]);
+    i_pipe0::write(PARENT | ROOT, success);
+    i_pipe1::write(msg[15], success);
 
     [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
     {
+      // note, pipe reads are issued blocking
       cv0[j & 0x7] = o_pipe0::read();
     }
 
@@ -605,6 +623,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // get initial hash state ( 64 -bytes ) and input message words
       // ( 64 -bytes ) from orchestrator kernel
 
+      // note, pipe reads are issued blocking
       [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
       {
         uint32_t a = i_pipe0::read();
@@ -629,14 +648,17 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
       // finally send 8 word output chaining value, as result of compression,
       // to orchestrator kernel
-      o_pipe0::write(state[0][0]);
-      o_pipe0::write(state[0][1]);
-      o_pipe0::write(state[0][2]);
-      o_pipe0::write(state[0][3]);
-      o_pipe0::write(state[1][0]);
-      o_pipe0::write(state[1][1]);
-      o_pipe0::write(state[1][2]);
-      o_pipe0::write(state[1][3]);
+      bool success;
+
+      // while pipe writes are non-blocking
+      o_pipe0::write(state[0][0], success);
+      o_pipe0::write(state[0][1], success);
+      o_pipe0::write(state[0][2], success);
+      o_pipe0::write(state[0][3], success);
+      o_pipe0::write(state[1][0], success);
+      o_pipe0::write(state[1][1], success);
+      o_pipe0::write(state[1][2], success);
+      o_pipe0::write(state[1][3], success);
     }
   });
 
