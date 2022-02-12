@@ -35,11 +35,11 @@ main(int argc, char** argv)
   // >>> import blake3
   // >>> a = [0xff] * (1 << 20)
   // >>> list(blake3.blake3(bytes(a)).digest())
-  // constexpr sycl::uchar expected[32] = {
-  //   3,   107, 169, 54, 188, 220, 105, 198, 56,  19, 158,
-  //   182, 125, 203, 4,  77,  220, 197, 132, 215, 44, 187,
-  //   125, 130, 161, 92, 234, 112, 223, 45,  212, 205
-  // };
+  constexpr sycl::uchar expected[32] = {
+    3,   107, 169, 54, 188, 220, 105, 198, 56,  19, 158,
+    182, 125, 203, 4,  77,  220, 197, 132, 215, 44, 187,
+    125, 130, 161, 92, 234, 112, 223, 45,  212, 205
+  };
 
   constexpr size_t i_size = chunk_count * blake3::CHUNK_LEN;
   constexpr size_t o_size = blake3::OUT_LEN;
@@ -59,9 +59,9 @@ main(int argc, char** argv)
   // device to host digest tx
   q.memcpy(o_h, o_d, blake3::OUT_LEN).wait();
 
-  // for (size_t i = 0; i < blake3::OUT_LEN; i++) {
-  //   assert(o_h[i] == expected[i]);
-  // }
+  for (size_t i = 0; i < blake3::OUT_LEN; i++) {
+    assert(o_h[i] == expected[i]);
+  }
 
   // managed by SYCL runtime
   sycl::free(i_d, q);
