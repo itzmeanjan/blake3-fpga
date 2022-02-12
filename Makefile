@@ -5,16 +5,18 @@ IFLAGS = -I./include
 
 FPGA_EMU_FLAGS = -DFPGA_EMU -fintelfpga
 
-# Another option is using `intel_a10gx_pac:pac_a10` as FPGA board and if you do so ensure that
-# on Intel Devcloud you use `fpga_runtime:arria10` as offload target
+# Another option is using `intel_s10sx_pac:pac_s10` as FPGA board and if you do so ensure that
+# on Intel Devcloud you use `fpga_runtime:stratix10` as offload target
 #
-# Otherwise if you stick to Stratix 10 board, consider offloading to `fpga_runtime:stratix10` VMs
+# Otherwise if you stick to Arria 10 board, consider offloading to `fpga_runtime:arria10` attached VMs
 # on Intel Devcloud
-FPGA_OPT_FLAGS = -DFPGA_HW -fintelfpga -fsycl-link=early -Xshardware -Xsboard=intel_s10sx_pac:pac_s10
+FPGA_OPT_FLAGS = -DFPGA_HW -fintelfpga -fsycl-link=early -Xshardware -Xsboard=intel_a10gx_pac:pac_a10
 
 # Consider enabing -Xsprofile, when generating h/w image, so that execution can be profile
 # using Intel Vtune
-FPGA_HW_FLAGS = -DFPGA_HW -fintelfpga -Xshardware -Xsboard=intel_s10sx_pac:pac_s10
+#
+# Consider reading 👆 note ( on top of `FPGA_OPT_FLAGS` definition )
+FPGA_HW_FLAGS = -DFPGA_HW -fintelfpga -Xshardware -Xsboard=intel_a10gx_pac:pac_a10
 
 all: fpga_emu_test
 
