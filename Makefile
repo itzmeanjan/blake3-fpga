@@ -9,7 +9,7 @@ FPGA_EMU_FLAGS = -DFPGA_EMU -fintelfpga
 # on Intel Devcloud you use `fpga_runtime:stratix10` as offload target
 #
 # Otherwise if you stick to Arria 10 board, consider offloading to `fpga_runtime:arria10` attached VMs
-# on Intel Devcloud
+# on Intel Devcloud ( default target board used in this project )
 FPGA_OPT_FLAGS = -DFPGA_HW -fintelfpga -fsycl-link=early -Xshardware -Xsboard=intel_a10gx_pac:pac_a10
 
 # Consider enabing -Xsprofile, when generating h/w image, so that execution can be profile
@@ -38,11 +38,16 @@ fpga_emu_bench:
 	# you should not rely on these numbers !
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_EMU_FLAGS) benchmark/main.cpp -o benchmark/fpga_emu.out
 
+fpga_opt_bench:
+	# output not supposed to be executed, instead consume report generated
+	# inside `benchmark/fpga_opt.prj/reports/` diretory
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_EMU_FLAGS) benchmark/main.cpp -o benchmark/fpga_opt.a
+
 fpga_hw_bench:
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_HW_FLAGS) -reuse-exe=benchmark/fpga_hw.out benchmark/main.cpp -o benchmark/fpga_hw.out
 
 clean:
-	find . -name '*.out' -o -name '*.a' -o -name '*.o' | xargs rm -f
+	find . -name '*.out' -o -name '*.a' -o -name '*.prj' | xargs rm -rf
 
 format:
 	find . -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i --style=Mozilla
