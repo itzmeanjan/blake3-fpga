@@ -44,13 +44,13 @@ constexpr sycl::uint4 rrot_7 = sycl::uint4(25);  // = 32 - 7
 //
 // Pipe to be used for sending initial hash state of 64 -bytes to compressor
 // kernel from orchestrator kernel
-using i_pipe0 = sycl::ext::intel::pipe<class HashStatePipe, uint32_t, 16>;
+using i_pipe0 = sycl::ext::intel::pipe<class HashStatePipe, uint32_t, 0>;
 // Pipe to be used for sending ( total ) 64 -bytes message words to compressor
 // kernel from orchestrator kernel
-using i_pipe1 = sycl::ext::intel::pipe<class MessageWordsPipe, uint32_t, 16>;
+using i_pipe1 = sycl::ext::intel::pipe<class MessageWordsPipe, uint32_t, 0>;
 // Pipe to be used for sending 32 -bytes output chaining value as result of
 // compression, from compressor to orchestrator kernel
-using o_pipe0 = sycl::ext::intel::pipe<class ChainingValuePipe, uint32_t, 8>;
+using o_pipe0 = sycl::ext::intel::pipe<class ChainingValuePipe, uint32_t, 0>;
 
 // BLAKE3 round, applied 7 times for mixing sixteen message words ( = total 64
 // -bytes ) into hash state, both column-wise and diagonally !
@@ -379,11 +379,9 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
     // --- begin computing root ( i.e. digest ) of blake3 binary merkle tree ---
 
-    [[intel::fpga_register]] const size_t rd_mem_offset = 16ul;
-
 #pragma unroll 16 // 512 -bit burst coalesced read from global memory
     for (size_t j = 0; j < 16; j++) {
-      msg[j] = mem_ptr[rd_mem_offset + j];
+      msg[j] = mem_ptr[16 + j];
     }
 
     // send initial hash state ( = 16 words ) to compressor kernel
@@ -458,7 +456,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
     }
   });
 
-  q.ext_oneapi_submit_barrier({ evt0, evt1 }).wait();
+  evt0.wait();
   sycl::free(mem, q);
 
   // while profiling blake3 hash calculation implementation, just considering
