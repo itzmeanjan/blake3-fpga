@@ -41,7 +41,7 @@ fpga_emu_bench:
 fpga_opt_bench:
 	# output not supposed to be executed, instead consume report generated
 	# inside `benchmark/fpga_opt.prj/reports/` diretory
-	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_EMU_FLAGS) benchmark/main.cpp -o benchmark/fpga_opt.a
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_OPT_FLAGS) benchmark/main.cpp -o benchmark/fpga_opt.a
 
 fpga_hw_bench:
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(OPTFLAGS) $(FPGA_HW_FLAGS) -reuse-exe=benchmark/fpga_hw.out benchmark/main.cpp -o benchmark/fpga_hw.out
