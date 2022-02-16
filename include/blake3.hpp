@@ -221,9 +221,6 @@ hash(sycl::queue& q,                       // SYCL compute queue
       sycl::device_ptr<sycl::uchar> o_ptr{ digest };
 
       [[intel::fpga_memory("BLOCK_RAM"),
-        intel::numbanks(8),
-        intel::bankwidth(4)]] uint32_t cv[8];
-      [[intel::fpga_memory("BLOCK_RAM"),
         intel::numbanks(16),
         intel::bankwidth(4)]] uint32_t msg[16];
       [[intel::fpga_memory("BLOCK_RAM"),
@@ -233,60 +230,63 @@ hash(sycl::queue& q,                       // SYCL compute queue
       sycl::private_ptr<uint32_t> state_ptr{ state };
       sycl::private_ptr<uint32_t> msg_ptr{ msg };
 
-      const size_t i_offset = 0;
       const size_t o_offset = chunk_count << 3;
 
-      [[intel::ivdep]] for (size_t c = 0; c < chunk_count; c++)
+      const size_t msg_blk_cnt = chunk_count << 4;
+      size_t chunk_idx = 0;
+      size_t msg_blk_idx = 0;
+
+      [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c++)
       {
-        const size_t i_offset_0 = i_offset + c * CHUNK_LEN;
-        const size_t o_offset_0 = o_offset + (c << 3);
+        const size_t i_offset_0 = (chunk_idx << 10) + (msg_blk_idx << 4);
+        const size_t o_offset_0 = o_offset + (chunk_idx << 3);
 
-        constexpr size_t rounds = CHUNK_LEN / BLOCK_LEN;
-
+        if (msg_blk_idx == 0) {
 #pragma unroll 8
-        for (size_t i = 0; i < 8; i++) {
-          cv[i] = IV[i];
+          for (size_t i = 0; i < 8; i++) {
+            state_ptr[i] = IV[i];
+          }
+        } else {
+#pragma unroll 8
+          for (size_t i = 0; i < 8; i++) {
+            state_ptr[i] = mem_ptr[o_offset_0 + i];
+          }
         }
 
-        for (size_t r = 0; r < rounds; r++) {
-          const size_t i_offset_0_r = i_offset_0 + (r << 4);
+#pragma unroll 4
+        for (size_t i = 0; i < 4; i++) {
+          state_ptr[8 + i] = IV[i];
+        }
+
+        state_ptr[12] = static_cast<uint32_t>(chunk_idx & 0xffffffff);
+        state_ptr[13] = static_cast<uint32_t>(chunk_idx >> 32);
+        state_ptr[14] = BLOCK_LEN;
+
+        if (msg_blk_idx == 0) {
+          state_ptr[15] = CHUNK_START;
+        } else if (msg_blk_idx == 15) {
+          state_ptr[15] = CHUNK_END;
+        } else {
+          state_ptr[15] = 0;
+        }
 
 #pragma unroll 16
-          for (size_t i = 0; i < 16; i++) {
-            msg_ptr[i] = word_from_le_bytes(i_ptr + i_offset_0_r + (i << 2));
-          }
-
-#pragma unroll 8
-          for (size_t i = 0; i < 8; i++) {
-            state_ptr[i] = cv[i];
-          }
-#pragma unroll 4
-          for (size_t i = 0; i < 4; i++) {
-            state_ptr[8 + i] = IV[i];
-          }
-
-          state_ptr[12] = static_cast<uint32_t>(c & 0xffffffff);
-          state_ptr[13] = static_cast<uint32_t>(c >> 32);
-          state_ptr[14] = BLOCK_LEN;
-          if (r == 0) {
-            state_ptr[15] = CHUNK_START;
-          } else if (r == 15) {
-            state_ptr[15] = CHUNK_END;
-          } else {
-            state_ptr[15] = 0;
-          }
-
-          compress(state_ptr, msg_ptr);
-
-#pragma unroll 8
-          for (size_t i = 0; i < 8; i++) {
-            cv[i] = state_ptr[i];
-          }
+        for (size_t i = 0; i < 16; i++) {
+          msg_ptr[i] = word_from_le_bytes(i_ptr + i_offset_0 + (i << 2));
         }
+
+        compress(state_ptr, msg_ptr);
 
 #pragma unroll 8
         for (size_t i = 0; i < 8; i++) {
-          mem_ptr[o_offset_0 + i] = cv[i];
+          mem_ptr[o_offset_0 + i] = state_ptr[i];
+        }
+
+        if ((chunk_idx + 1) == chunk_count) {
+          chunk_idx = 0;
+          msg_blk_idx++;
+        } else {
+          chunk_idx++;
         }
       }
 
