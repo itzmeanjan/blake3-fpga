@@ -7,12 +7,7 @@
 namespace blake3 {
 
 // just to avoid kernel name mangling in optimization report
-class kernelBlake3Orchestrator;
-class kernelBlake3Compressor;
-
-// just to avoid pipe identifier mangling in optimization report
-class InWordsPipe;
-class OutWordsPipe;
+class kernelBlake3Hash;
 
 // Following BLAKE3 constants taken from
 // https://github.com/itzmeanjan/blake3/blob/1c58f6a343baee52ba1fe7fc98bfb280b6d567da/include/blake3_consts.hpp
@@ -35,17 +30,6 @@ constexpr uint32_t CHUNK_START = 1 << 0;
 constexpr uint32_t CHUNK_END = 1 << 1;
 constexpr uint32_t PARENT = 1 << 2;
 constexpr uint32_t ROOT = 1 << 3;
-
-// For SYCL pipe, following design document
-// https://github.com/intel/llvm/blob/ad9ac98/sycl/doc/extensions/proposed/SYCL_EXT_INTEL_DATAFLOW_PIPES.asciidoc
-//
-//
-// Pipe to be used for sending initial hash state ( 64 -bytes ) & input message
-// words ( 64 -bytes ) to compressor kernel from orchestrator kernel
-using i_pipe = sycl::ext::intel::pipe<InWordsPipe, uint32_t, 0>;
-// Pipe to be used for sending 32 -bytes output chaining value as result of
-// compression, from compressor to orchestrator kernel
-using o_pipe = sycl::ext::intel::pipe<OutWordsPipe, uint32_t, 0>;
 
 // Binary logarithm of n, when n = 2 ^ i | i = {1, 2, 3, ...}
 const size_t
@@ -145,12 +129,25 @@ permute(sycl::private_ptr<uint32_t> msg)
 void
 compress(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
 {
-  for (size_t i = 0; i < ROUNDS; i++) {
-    round(state, msg);
-    if (i < 6) {
-      permute(msg);
-    }
-  }
+  round(state, msg);
+  permute(msg);
+
+  round(state, msg);
+  permute(msg);
+
+  round(state, msg);
+  permute(msg);
+
+  round(state, msg);
+  permute(msg);
+
+  round(state, msg);
+  permute(msg);
+
+  round(state, msg);
+  permute(msg);
+
+  round(state, msg);
 
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
@@ -217,188 +214,153 @@ hash(sycl::queue& q,                       // SYCL compute queue
   const size_t mem_size = (chunk_count * OUT_LEN) << 1;
   uint32_t* mem = static_cast<uint32_t*>(sycl::malloc_device(mem_size, q));
 
-  sycl::event evt0 = q.single_task<kernelBlake3Orchestrator>([=]() {
-    sycl::device_ptr<sycl::uchar> i_ptr{ input };
-    sycl::device_ptr<uint32_t> mem_ptr{ mem };
-    sycl::device_ptr<sycl::uchar> o_ptr{ digest };
+  sycl::event evt =
+    q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
+      sycl::device_ptr<sycl::uchar> i_ptr{ input };
+      sycl::device_ptr<uint32_t> mem_ptr{ mem };
+      sycl::device_ptr<sycl::uchar> o_ptr{ digest };
 
-    [[intel::fpga_memory("BLOCK_RAM"),
-      intel::numbanks(8),
-      intel::bankwidth(4)]] uint32_t cv[8];
-    [[intel::fpga_memory("BLOCK_RAM"),
-      intel::numbanks(16),
-      intel::bankwidth(4)]] uint32_t msg[16];
+      [[intel::fpga_memory("BLOCK_RAM"),
+        intel::numbanks(8),
+        intel::bankwidth(4)]] uint32_t cv[8];
+      [[intel::fpga_memory("BLOCK_RAM"),
+        intel::numbanks(16),
+        intel::bankwidth(4)]] uint32_t msg[16];
+      [[intel::fpga_memory("BLOCK_RAM"),
+        intel::numbanks(16),
+        intel::bankwidth(4)]] uint32_t state[16];
 
-    const size_t i_offset = 0;
-    const size_t o_offset = chunk_count << 3;
+      sycl::private_ptr<uint32_t> state_ptr{ state };
+      sycl::private_ptr<uint32_t> msg_ptr{ msg };
 
-    [[intel::ivdep]] for (size_t c = 0; c < chunk_count; c++)
-    {
-      const size_t i_offset_0 = i_offset + c * CHUNK_LEN;
-      const size_t o_offset_0 = o_offset + (c << 3);
+      const size_t i_offset = 0;
+      const size_t o_offset = chunk_count << 3;
 
-      constexpr size_t rounds = CHUNK_LEN / BLOCK_LEN;
-
-#pragma unroll 8
-      for (size_t i = 0; i < 8; i++) {
-        cv[i] = IV[i];
-      }
-
-      for (size_t r = 0; r < rounds; r++) {
-        const size_t i_offset_0_r = i_offset_0 + r * BLOCK_LEN;
-
-#pragma unroll 16
-        for (size_t i = 0; i < 16; i++) {
-          msg[i] = word_from_le_bytes(i_ptr + i_offset_0_r + (i << 2));
-        }
-
-        [[intel::ivdep]] for (size_t i = 0; i < 8; i++)
-        {
-          i_pipe::write(cv[i]);
-        }
-        [[intel::ivdep]] for (size_t i = 0; i < 4; i++)
-        {
-          i_pipe::write(IV[i]);
-        }
-
-        i_pipe::write(static_cast<uint32_t>(c & 0xffffffff));
-        i_pipe::write(static_cast<uint32_t>(c >> 32));
-        i_pipe::write(BLOCK_LEN);
-        if (r == 0) {
-          i_pipe::write(CHUNK_START);
-        } else if (r == 15) {
-          i_pipe::write(CHUNK_END);
-        } else {
-          i_pipe::write(0);
-        }
-
-        [[intel::ivdep]] for (size_t i = 0; i < 16; i++)
-        {
-          i_pipe::write(msg[i]);
-        }
-
-        [[intel::ivdep]] for (size_t i = 0; i < 8; i++)
-        {
-          cv[i] = o_pipe::read();
-        }
-      }
-
-#pragma unroll 8
-      for (size_t i = 0; i < 8; i++) {
-        mem_ptr[o_offset_0 + i] = cv[i];
-      }
-    }
-
-    const size_t levels = bin_log(chunk_count) - 1;
-
-    for (size_t l = 0; l < levels; l++) {
-      const size_t i_offset = (chunk_count << 3) >> l;
-      const size_t o_offset = i_offset >> 1;
-      const size_t node_cnt = chunk_count >> (l + 1);
-
-      [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i++)
+      [[intel::ivdep]] for (size_t c = 0; c < chunk_count; c++)
       {
-        const size_t i_offset_0 = i_offset + (i << 4);
-        const size_t o_offset_0 = o_offset + (i << 3);
+        const size_t i_offset_0 = i_offset + c * CHUNK_LEN;
+        const size_t o_offset_0 = o_offset + (c << 3);
+
+        constexpr size_t rounds = CHUNK_LEN / BLOCK_LEN;
+
+#pragma unroll 8
+        for (size_t i = 0; i < 8; i++) {
+          cv[i] = IV[i];
+        }
+
+        for (size_t r = 0; r < rounds; r++) {
+          const size_t i_offset_0_r = i_offset_0 + (r << 4);
 
 #pragma unroll 16
-        for (size_t j = 0; j < 16; j++) {
-          msg[j] = mem_ptr[i_offset_0 + j];
-        }
+          for (size_t i = 0; i < 16; i++) {
+            msg_ptr[i] = word_from_le_bytes(i_ptr + i_offset_0_r + (i << 2));
+          }
 
-        [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
-        {
-          i_pipe::write(IV[j]);
-        }
-        [[intel::ivdep]] for (size_t j = 0; j < 4; j++)
-        {
-          i_pipe::write(IV[j]);
-        }
+#pragma unroll 8
+          for (size_t i = 0; i < 8; i++) {
+            state_ptr[i] = cv[i];
+          }
+#pragma unroll 4
+          for (size_t i = 0; i < 4; i++) {
+            state_ptr[8 + i] = IV[i];
+          }
 
-        i_pipe::write(0);
-        i_pipe::write(0);
-        i_pipe::write(BLOCK_LEN);
-        i_pipe::write(PARENT);
+          state_ptr[12] = static_cast<uint32_t>(c & 0xffffffff);
+          state_ptr[13] = static_cast<uint32_t>(c >> 32);
+          state_ptr[14] = BLOCK_LEN;
+          if (r == 0) {
+            state_ptr[15] = CHUNK_START;
+          } else if (r == 15) {
+            state_ptr[15] = CHUNK_END;
+          } else {
+            state_ptr[15] = 0;
+          }
 
-        [[intel::ivdep]] for (size_t j = 0; j < 16; j++)
-        {
-          i_pipe::write(msg[j]);
-        }
+          compress(state_ptr, msg_ptr);
 
-        [[intel::ivdep]] for (size_t j = 0; j < 8; j++)
-        {
-          cv[j] = o_pipe::read();
+#pragma unroll 8
+          for (size_t i = 0; i < 8; i++) {
+            cv[i] = state_ptr[i];
+          }
         }
 
 #pragma unroll 8
-        for (size_t j = 0; j < 8; j++) {
-          mem_ptr[o_offset_0 + j] = cv[j];
+        for (size_t i = 0; i < 8; i++) {
+          mem_ptr[o_offset_0 + i] = cv[i];
         }
       }
-    }
+
+      const size_t levels = bin_log(chunk_count) - 1;
+
+      for (size_t l = 0; l < levels; l++) {
+        const size_t i_offset = (chunk_count << 3) >> l;
+        const size_t o_offset = i_offset >> 1;
+        const size_t node_cnt = chunk_count >> (l + 1);
+
+        [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i++)
+        {
+          const size_t i_offset_0 = i_offset + (i << 4);
+          const size_t o_offset_0 = o_offset + (i << 3);
+
+#pragma unroll 16
+          for (size_t j = 0; j < 16; j++) {
+            msg_ptr[j] = mem_ptr[i_offset_0 + j];
+          }
+
+#pragma unroll 8
+          for (size_t i = 0; i < 8; i++) {
+            state_ptr[i] = IV[i];
+          }
+#pragma unroll 4
+          for (size_t i = 0; i < 4; i++) {
+            state_ptr[8 + i] = IV[i];
+          }
+
+          state_ptr[12] = 0;
+          state_ptr[13] = 0;
+          state_ptr[14] = BLOCK_LEN;
+          state_ptr[15] = PARENT;
+
+          compress(state_ptr, msg_ptr);
+
+#pragma unroll 8
+          for (size_t j = 0; j < 8; j++) {
+            mem_ptr[o_offset_0 + j] = state_ptr[j];
+          }
+        }
+      }
 
     // computing root chaining value ( blake3 digest )
 #pragma unroll 16
-    for (size_t j = 0; j < 16; j++) {
-      msg[j] = mem_ptr[16 + j];
-    }
-
-    [[intel::ivdep]] for (size_t j = 0; j < 8; j++) { i_pipe::write(IV[j]); }
-    [[intel::ivdep]] for (size_t j = 0; j < 4; j++) { i_pipe::write(IV[j]); }
-
-    i_pipe::write(0);
-    i_pipe::write(0);
-    i_pipe::write(BLOCK_LEN);
-    i_pipe::write(PARENT | ROOT);
-
-    [[intel::ivdep]] for (size_t j = 0; j < 16; j++) { i_pipe::write(msg[j]); }
-
-    [[intel::ivdep]] for (size_t j = 0; j < 8; j++) { cv[j] = o_pipe::read(); }
-
-    // writing little endian byte digest back to desired memory allocation
-    words_to_le_bytes(cv, o_ptr);
-  });
-
-  sycl::event evt1 = q.single_task<kernelBlake3Compressor>([=]() {
-    [[intel::fpga_memory("BLOCK_RAM"),
-      intel::numbanks(16),
-      intel::bankwidth(4)]] uint32_t state[16];
-    [[intel::fpga_memory("BLOCK_RAM"),
-      intel::numbanks(16),
-      intel::bankwidth(4)]] uint32_t msg[16];
-
-    sycl::private_ptr<uint32_t> state_ptr{ state };
-    sycl::private_ptr<uint32_t> msg_ptr{ msg };
-
-    while (true) {
-      [[intel::ivdep]] for (size_t i = 0; i < 16; i++)
-      {
-        state_ptr[i] = i_pipe::read();
+      for (size_t j = 0; j < 16; j++) {
+        msg_ptr[j] = mem_ptr[16 + j];
       }
-      [[intel::ivdep]] for (size_t i = 0; i < 16; i++)
-      {
-        msg_ptr[i] = i_pipe::read();
+
+#pragma unroll 8
+      for (size_t i = 0; i < 8; i++) {
+        state_ptr[i] = IV[i];
       }
+#pragma unroll 4
+      for (size_t i = 0; i < 4; i++) {
+        state_ptr[8 + i] = IV[i];
+      }
+
+      state_ptr[12] = 0;
+      state_ptr[13] = 0;
+      state_ptr[14] = BLOCK_LEN;
+      state_ptr[15] = PARENT | ROOT;
 
       compress(state_ptr, msg_ptr);
 
-      [[intel::ivdep]] for (size_t i = 0; i < 8; i++)
-      {
-        o_pipe::write(state_ptr[i]);
-      }
-    }
-  });
+      // writing little endian byte digest back to desired memory allocation
+      words_to_le_bytes(state_ptr, o_ptr);
+    });
 
-  evt0.wait();
+  evt.wait();
   sycl::free(mem, q);
 
-  // while profiling blake3 hash calculation implementation, just considering
-  // orchestrator kernel's runtime ( in nanosecond level granularity ), because
-  // that's the kernel which drives whole blake3 hash computation circuit
-  //
-  // Shall I also consider blake3 compressor kernel's execution time ?
   if (ts != nullptr) {
-    *ts = time_event(evt0);
+    *ts = time_event(evt);
   }
 }
 }
