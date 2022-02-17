@@ -3,13 +3,17 @@ BLAKE3 on FPGA
 
 ## Design
 
-Imagine input byte array of 2048 -bytes to be hashed using BLAKE3, meaning input has 2 chunks, because BLAKE3 chunk size is 1KB. Each chunk has 16 message blocks, each of length 64 -bytes ( read 16 message words, because BLAKE3 word size is 32 -bit ). 16 message blocks of each chunk are required to be compressed 16 times sequentially --- output chaining value of i-th message block compression is used as input chaining value of (i + 1)-th message block, while first message block's input chaining value is constant initial hash values and 0 <= i <= 14. Due to this data dependency, in following FPGA design of BLAKE3, I compress j-th message block of i-th chunk, then j-th message block of (i + 1)-th chunk and it continues until we reach last chunk's j-th message block. All these N -many output chaining values of j-th message block compression are written to global memory. Now in next iteration it's time to compress (j + 1)-th message block for each of N -many chunks, while using j-th message block compression's output chaining values as input chaining value for respective chunk. This way all 16 message blocks are compressed for each of N -many chunks and those N -many output chaining values are considered leaf nodes of Binary Merkle Tree. Now computing BLAKE3 digest is simply finding root of Merkle Tree, while all intermediate nodes are computed by BLAKE3 `compress( ... )` function.
+Imagine input byte array of 2048 -bytes to be hashed using BLAKE3, meaning input has 2 chunks, because BLAKE3 chunk size is 1KB. Each chunk has 16 message blocks, each of length 64 -bytes ( read 16 message words, because BLAKE3 word size is 32 -bit ). Each chunk is required to be compressed 16 times sequentially ( because it consists of 16 message blocks ) --- output chaining value of i-th message block compression is used as input chaining value of (i + 1)-th message block, while first message block's input chaining value is constant initial hash values and 0 <= i <= 14. Due to this data dependency, in following FPGA design of BLAKE3, I compress j-th message block of i-th chunk, then j-th message block of (i + 1)-th chunk and it continues until we reach last chunk's j-th message block. All these N -many output chaining values of j-th message block compression are written to global memory. Now in next iteration it's time to compress (j + 1)-th message block for each of N -many chunks, while using j-th message block compression's output chaining values as input chaining values for respective chunk. This way all 16 message blocks are compressed for each of N -many chunks and those N -many output chaining values are considered leaf nodes of Binary Merkle Tree. Now computing BLAKE3 digest is simply finding root of Merkle Tree, while all intermediate nodes are computed by BLAKE3 `compress( ... )` function.
 
 ![blake3-design-on-fpga](pic/blake3-fpga-design.png)
 
 In above design diagram, you may want to following color coding to find out how 16 message blocks of each chunks are scheduled for compression in *chunk compression* phase.
 
 > You may want to see BLAKE3 targeting multi-core CPU/ GPGPU, written using SYCL/ DPC++; see [here](https://github.com/itzmeanjan/blake3)
+
+> BLAKE3 [specification](https://github.com/BLAKE3-team/BLAKE3-specs/blob/ac78a717924dd9e6f16f547baa916c6f71470b1a/blake3.pdf) which I followed during this design.
+
+> BLAKE3 reference [implementation](https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs) was also helpful.
 
 ## Prerequisite
 
@@ -54,23 +58,23 @@ You can check functional correctness of BLAKE3 implementation on CPU by emulatio
 make
 ```
 
-You probably would like to see optimization report, which can be generated on non-FPGA attached host.
+You probably would like to see optimization report, which can be generated on non-FPGA attached host; just installing oneAPI basekit allows doing this.
 
 ```bash
 make fpga_opt_test
 ```
 
-*You also have the option of running benchmark on CPU emulation, but you probably don't want to use those numbers as actual benchmark.*
+*You also have the option of running benchmark on CPU emulation, but you don't want to use those numbers as actual benchmark.*
 
 ```bash
-make fpga_emu_bench # don't use as actual benchmark !
+make fpga_emu_bench # don't take them as actual benchmark !
 ```
 
 For running FPGA h/w test/ benchmark you'll need to go through **long** h/w synthesis phase, which can be executed on Intel Devcloud platform. See [here](https://devcloud.intel.com/oneapi/get_started/opencl).
 
 ### Job Submission
 
-For easing FPGA h/w compilation/ execution job submissions on Intel Devcloud platform, I've use following scripts.
+For easing FPGA h/w compilation/ execution job submissions on Intel Devcloud platform, I use following scripts.
 
 Assuming you're in root of this project
 
@@ -205,9 +209,11 @@ Benchmarking BLAKE3 FPGA implementation
                 1024 MB		            1.097243 s		         167.424993 ms		          83.313750 us
 ```
 
-Note, this design can benefit from replicating data path which compresses message blocks, but that comes with increased resource consumption. This (simple + straight-forward) baseline design, which interacts with global memory quite often, slows down due to high global memory access latecy. One future effort that can be put in improving this design is reducing interaction with global memory system and increasing usage of on-chip BRAM, while synthesizing more ( power of 2 -many ) replicas of BLAKE3 `compress( ... )` function, at cost of higher resource usage.
+Note, this design can benefit from replicating data path which compresses message blocks, but that comes with increased resource consumption. This (simple + straight-forward) baseline design, which interacts with global memory quite often, slows down due to high global memory access latecy.
 
-> I've also experimented with SYCL pipe based design pattern where producer-consumer pattern is utilized, reducing global memory access; but it turns out that due to hierarchical data dependency in BLAKE3 binary merkle tree, that pattern doesn't yield much useful results.
+Future efforts that can be put in improving this design is reducing interaction with global memory system and increasing usage of on-chip BRAM, while synthesizing more ( power of 2 -many ) replicas of BLAKE3 `compress( ... )` function, at cost of higher resource usage.
+
+> I've also experimented with SYCL pipe based design pattern ( in BLAKE3 context ) where producer ( read orchestrator ) <-> consumer ( read compressor ) pattern is utilized, reducing global memory access; but it turns out that due to hierarchical data dependency in BLAKE3 binary merkle tree, that pattern doesn't yield much useful results and pipe ends up slowing down due to stalling in both sides.
 
 **👇 are taken from final report generated after FPGA h/w synthesis, targeting Intel Arria 10 board**
 
