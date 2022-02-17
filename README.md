@@ -5,7 +5,7 @@ BLAKE3 on FPGA
 
 Imagine input byte array of 2048 -bytes to be hashed using BLAKE3, meaning input has 2 chunks, because BLAKE3 chunk size is 1KB. Each chunk has 16 message blocks, each of length 64 -bytes ( read 16 message words, because BLAKE3 word size is 32 -bit ). 16 message blocks of each chunk are required to be compressed 16 times sequentially --- output chaining value of i-th message block compression is used as input chaining value of (i + 1)-th message block, while first message block's input chaining value is constant initial hash values and 0 <= i <= 14. Due to this data dependency, in following FPGA design of BLAKE3, I compress j-th message block of i-th chunk, then j-th message block of (i + 1)-th chunk and it continues until we reach last chunk's j-th message block. All these N -many output chaining values of j-th message block compression are written to global memory. Now in next iteration it's time to compress (j + 1)-th message block for each of N -many chunks, while using j-th message block compression's output chaining values as input chaining value for respective chunk. This way all 16 message blocks are compressed for each of N -many chunks and those N -many output chaining values are considered leaf nodes of Binary Merkle Tree. Now computing BLAKE3 digest is simply finding root of Merkle Tree, while all intermediate nodes are computed by BLAKE3 `compress( ... )` function.
 
-![blake3-design-on-fpga](./blake3-fpga-design.png)
+![blake3-design-on-fpga](pic/blake3-fpga-design.png)
 
 In above design diagram, you may want to following color coding to find out how 16 message blocks of each chunks are scheduled for compression in *chunk compression* phase.
 
@@ -213,16 +213,16 @@ Note, this design can benefit from replicating data path which compresses messag
 
 ### Quartus Fitter Summary
 
-![quartus-fitter](./quartus-fitter.png)
+![quartus-fitter](pic/quartus-fitter.png)
 
 ### Design Clocking at
 
-![clock-freq](./clock-freq.png)
+![clock-freq](pic/clock-freq.png)
 
 ### Loop Pipelining/ II/ fMAX/ latency
 
-![loop-status](./loop-status.png)
+![loop-status](pic/loop-status.png)
 
 ### Resource Usage
 
-![resource-usage](./resource-usage.png)
+![resource-usage](pic/resource-usage.png)
