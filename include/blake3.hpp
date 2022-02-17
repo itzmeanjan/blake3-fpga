@@ -264,18 +264,10 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // bank count !
       //
       // why not use `fpga_register`, array size is relatively small ?
-      [[intel::fpga_memory("BLOCK_RAM"),
-        intel::numbanks(16),
-        intel::bankwidth(4)]] uint32_t msg_0[16];
-      [[intel::fpga_memory("BLOCK_RAM"),
-        intel::numbanks(16),
-        intel::bankwidth(4)]] uint32_t state_0[16];
-      [[intel::fpga_memory("BLOCK_RAM"),
-        intel::numbanks(16),
-        intel::bankwidth(4)]] uint32_t msg_1[16];
-      [[intel::fpga_memory("BLOCK_RAM"),
-        intel::numbanks(16),
-        intel::bankwidth(4)]] uint32_t state_1[16];
+      [[intel::fpga_register]] uint32_t msg_0[16];
+      [[intel::fpga_register]] uint32_t state_0[16];
+      [[intel::fpga_register]] uint32_t msg_1[16];
+      [[intel::fpga_register]] uint32_t state_1[16];
 
       // because these are allocated on FPFGA on-chip BRAM ( private to this
       // work-item )
