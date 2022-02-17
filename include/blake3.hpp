@@ -1,12 +1,11 @@
 #pragma once
-#define SYCL_SIMPLE_SWIZZLES 1
 #include "common.hpp"
 #include <cassert>
 #include <sycl/ext/intel/fpga_extensions.hpp>
 
 namespace blake3 {
 
-// just to avoid kernel name mangling in optimization report
+// Just to avoid kernel name mangling in optimization report
 class kernelBlake3Hash;
 
 // Following BLAKE3 constants taken from
@@ -56,12 +55,17 @@ is_valid_rot_pos(const uint8_t x)
 // Circular right shift of blake3 word `n` ( 32 -bit ) by `x` bit places
 // where it's compile time checked that x >= 0 && x < 32
 template<uint8_t x>
-static const uint32_t
+static inline const uint32_t
 rotr(const uint32_t n) requires(is_valid_rot_pos(x))
 {
   return (n >> x) | (n << (32 - x));
 }
 
+// BLAKE3 mixing function, which mixes message words ( 64 -bytes ) into hash
+// state either column-wise/ diagonally
+//
+// Taken from
+// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L42-L52
 inline void
 g(sycl::private_ptr<uint32_t> state,
   const size_t a,
@@ -81,28 +85,36 @@ g(sycl::private_ptr<uint32_t> state,
   state[b] = rotr<7>(state[b] ^ state[c]);
 }
 
+// BLAKE3 round function, which is invoked 7 times for mixing 64 -bytes message
+// words into hash state
+//
+// During each mixing round, a permutation of 64 -bytes message words are mixed
+// into hash state both column-wise and diagonally
+//
+// Taken from
+// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L54-L65
 inline void
 round(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
 {
-  // column-wise mixing message words into hash state
+  // column-wise mixing of message words into hash state
   g(state, 0, 4, 8, 12, msg[0], msg[1]);
   g(state, 1, 5, 9, 13, msg[2], msg[3]);
   g(state, 2, 6, 10, 14, msg[4], msg[5]);
   g(state, 3, 7, 11, 15, msg[6], msg[7]);
 
-  // diagonal mixing message words into hash state
+  // diagonal mixing of message words into hash state
   g(state, 0, 5, 10, 15, msg[8], msg[9]);
   g(state, 1, 6, 11, 12, msg[10], msg[11]);
   g(state, 2, 7, 8, 13, msg[12], msg[13]);
   g(state, 3, 4, 9, 14, msg[14], msg[15]);
 }
 
-// Permute sixteen BLAKE3 message words of each 64 -bytes wide block, after
+// Permute sixteen BLAKE3 message words of 64 -bytes wide block, after
 // each round of mixing
 //
 // This routine to be invoked six times ( after each round of mixing, except
-// last one, because doing that is redundant ) from following `compress( ... )`
-// function
+// last one, because doing that is not necessary ) from following `compress( ...
+// )` function
 //
 // See
 // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1623-L1639
@@ -126,32 +138,49 @@ permute(sycl::private_ptr<uint32_t> msg)
   }
 }
 
+// BLAKE3 compression function, which is used for compressing 64 -bytes
+// input message block ( 16 words ) into 32 -bytes output chaining value ( 8
+// words )
 void
 compress(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
 {
+  // round 1
   round(state, msg);
   permute(msg);
 
+  // round 2
   round(state, msg);
   permute(msg);
 
+  // round 3
   round(state, msg);
   permute(msg);
 
+  // round 4
   round(state, msg);
   permute(msg);
 
+  // round 5
   round(state, msg);
   permute(msg);
 
+  // round 6
   round(state, msg);
   permute(msg);
 
+  // round 7
   round(state, msg);
 
+  // prepare output chaining value of this message block compression
 #pragma unroll 8
   for (size_t i = 0; i < 8; i++) {
     state[i] ^= state[8 + i];
+    // note, that
+    // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
+    // can be skipped, because it doesn't affect what output chaining value will
+    // be
+    //
+    // results in lesser hardware synthesized !
   }
 }
 
@@ -177,7 +206,7 @@ word_to_le_bytes(const uint32_t word, sycl::device_ptr<sycl::uchar> output)
 }
 
 // Eight consecutive BLAKE3 message words are converted to 32 little endian
-// bytes
+// bytes ( used when writing BLAKE3 digest back to global memory )
 void
 words_to_le_bytes(const sycl::private_ptr<uint32_t> msg_words,
                   sycl::device_ptr<sycl::uchar> output)
@@ -190,7 +219,7 @@ words_to_le_bytes(const sycl::private_ptr<uint32_t> msg_words,
 
 // BLAKE3 hash function, can be used when chunk count is power of 2
 //
-// Note, chunk count is preferred to be relatively large number ( say >= 2^20 )
+// Note, chunk count is preferred to be relatively large number ( say >= 2^10 )
 // because this function is supposed to be executed on accelerator i.e. FPGA
 //
 // See
@@ -211,15 +240,30 @@ hash(sycl::queue& q,                       // SYCL compute queue
   assert(chunk_count >= (1 << 10)); // but you would probably want >= 2^20
   assert((chunk_count & (chunk_count - 1)) == 0); // ensure power of 2
 
+  // temporary memory allocation on global memory for keeping all intermediate
+  // chaining values
+  //
+  // note, chaining values are organized as nodes are kept in computed ( all
+  // intermediate nodes ) binary merkle tree
+  //
+  // @todo this allocation size can be improved !
   const size_t mem_size = (chunk_count * OUT_LEN) << 1;
   uint32_t* mem = static_cast<uint32_t*>(sycl::malloc_device(mem_size, q));
 
   sycl::event evt =
     q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
+      // Just to hint that FPGA hardware doesn't need to interface with host
       sycl::device_ptr<sycl::uchar> i_ptr{ input };
       sycl::device_ptr<uint32_t> mem_ptr{ mem };
       sycl::device_ptr<sycl::uchar> o_ptr{ digest };
 
+      // on-chip BRAM based allocation where input message words ( 64 -bytes )
+      // and hash state (64 -bytes ) are kept
+      //
+      // attempting to get stall free access to all 16 words by increasing
+      // bank count !
+      //
+      // why not use `fpga_register`, array size is relatively small ?
       [[intel::fpga_memory("BLOCK_RAM"),
         intel::numbanks(16),
         intel::bankwidth(4)]] uint32_t msg[16];
@@ -227,6 +271,10 @@ hash(sycl::queue& q,                       // SYCL compute queue
         intel::numbanks(16),
         intel::bankwidth(4)]] uint32_t state[16];
 
+      // because these are allocated on FPFGA on-chip BRAM ( private to this
+      // work-item )
+      //
+      // note, there's only one work-item
       sycl::private_ptr<uint32_t> state_ptr{ state };
       sycl::private_ptr<uint32_t> msg_ptr{ msg };
 
@@ -236,23 +284,61 @@ hash(sycl::queue& q,                       // SYCL compute queue
       size_t chunk_idx = 0;
       size_t msg_blk_idx = 0;
 
+      // chunk compression section
+      //
+      // each chunk has 16 message blocks, which are compressed sequentially
+      // due to input/ output chaining value dependency
+      //
+      // in following for loop i-th chunk's j-th message block is compressed
+      // first, resulting chaining value is written back to global memory (
+      // expensive op ! )
+      //
+      // after that (i + 1)-th chunk's j-th message block is compressed and
+      // resulting chaining value is written to next 32 -bytes memory on SYCL
+      // global memory
+      //
+      // this keep going on, untill all N -many chunk's j-th message block is
+      // processed
+      //
+      // until now, j = 0
+      //
+      // now j = 1
+      //
+      // and we start by processing i-th chunk's j-th block and keep doing until
+      // all chunk's second message block is compressed
+      //
+      // finally, j = 15 i.e. last message block of each chunk
+      //
+      // for j = 15, all chunk's message blocks are compressed and it produces N
+      // -many output chaining values for N -many chunks, which were compressed
+      // in 16 consecutive rounds
       [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c++)
       {
         const size_t i_offset_0 = (chunk_idx << 10) + (msg_blk_idx << 4);
         const size_t o_offset_0 = o_offset + (chunk_idx << 3);
 
+        // for first message block of each chunk, input chaining values are
+        // constant initial hash values
         if (msg_blk_idx == 0) {
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_ptr[i] = IV[i];
           }
         } else {
+        // for all remaining message blocks input chaining values are
+        // output chaining values obtained by compressing previous message block
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_ptr[i] = mem_ptr[o_offset_0 + i];
           }
         }
 
+      // prepare hash state, see
+      // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1649-L1657
+      // to understand how hash state is prepared
+      //
+      // or you may want to see non-SIMD implementation
+      // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L82-L99
 #pragma unroll 4
         for (size_t i = 0; i < 4; i++) {
           state_ptr[8 + i] = IV[i];
@@ -270,18 +356,24 @@ hash(sycl::queue& q,                       // SYCL compute queue
           state_ptr[15] = 0;
         }
 
+      // 64 -bytes message block read from global memory ( expensive, but
+      // nothing much to do to avoid this ! )
 #pragma unroll 16
         for (size_t i = 0; i < 16; i++) {
           msg_ptr[i] = word_from_le_bytes(i_ptr + i_offset_0 + (i << 2));
         }
 
+        // compress this message block
         compress(state_ptr, msg_ptr);
 
+      // obtain 32 -bytes output chaining values, and write back to global
+      // memory ( expensive, can attempt to avoid this ! )
 #pragma unroll 8
         for (size_t i = 0; i < 8; i++) {
           mem_ptr[o_offset_0 + i] = state_ptr[i];
         }
 
+        // point to next chunk/ messae block
         if ((chunk_idx + 1) == chunk_count) {
           chunk_idx = 0;
           msg_blk_idx++;
@@ -290,23 +382,32 @@ hash(sycl::queue& q,                       // SYCL compute queue
         }
       }
 
+      // except root ( chaining values ) of BLAKE3 merkle tree, all intermediate
+      // parent chaining values are to be computed in data-dependent `levels`
+      // -many rounds
       const size_t levels = bin_log(chunk_count) - 1;
 
+      // level (i + 1) consumes level i as input ( where leaf nodes are already
+      // computed, see above chunk compression section )
       for (size_t l = 0; l < levels; l++) {
         const size_t i_offset = (chunk_count << 3) >> l;
         const size_t o_offset = i_offset >> 1;
         const size_t node_cnt = chunk_count >> (l + 1);
 
+        // these many intermediate chaining values are to be computed in this
+        // level of BLAKE3 binary merkle tree
         [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i++)
         {
           const size_t i_offset_0 = i_offset + (i << 4);
           const size_t o_offset_0 = o_offset + (i << 3);
 
+        // read 64 -bytes message words from global memory
 #pragma unroll 16
           for (size_t j = 0; j < 16; j++) {
             msg_ptr[j] = mem_ptr[i_offset_0 + j];
           }
 
+        // input chaining values being placed in first 8 words of hash state
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_ptr[i] = IV[i];
@@ -321,8 +422,10 @@ hash(sycl::queue& q,                       // SYCL compute queue
           state_ptr[14] = BLOCK_LEN;
           state_ptr[15] = PARENT;
 
+          // compressing this message block
           compress(state_ptr, msg_ptr);
 
+        // producing parent chaining value
 #pragma unroll 8
           for (size_t j = 0; j < 8; j++) {
             mem_ptr[o_offset_0 + j] = state_ptr[j];
@@ -330,7 +433,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
         }
       }
 
-    // computing root chaining value ( blake3 digest )
+    // computing root chaining value ( BLAKE3 digest )
 #pragma unroll 16
       for (size_t j = 0; j < 16; j++) {
         msg_ptr[j] = mem_ptr[16 + j];
@@ -352,7 +455,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
       compress(state_ptr, msg_ptr);
 
-      // writing little endian byte digest back to desired memory allocation
+      // writing little endian digest bytes back to desired memory allocation
       words_to_le_bytes(state_ptr, o_ptr);
     });
 
