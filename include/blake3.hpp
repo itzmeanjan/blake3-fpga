@@ -121,11 +121,9 @@ round(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
 inline void
 permute(sycl::private_ptr<uint32_t> msg)
 {
-  // additional on-chip block RAM based memory ( = 64 -bytes ) for helping in
+  // additional FPGA register based memory ( = 64 -bytes ) for helping in
   // message word permutation
-  [[intel::fpga_memory("BLOCK_RAM"),
-    intel::numbanks(16),
-    intel::bankwidth(4)]] uint32_t permuted[16];
+  [[intel::fpga_register]] uint32_t permuted[16];
 
 #pragma unroll 16
   for (size_t i = 0; i < 16; i++) {
@@ -252,27 +250,24 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
   sycl::event evt =
     q.single_task<kernelBlake3Hash>([=]() [[intel::kernel_args_restrict]] {
-      // Just to hint that FPGA hardware doesn't need to interface with host
+      // Just to hint that Load Store Units don't need to interface with host
       sycl::device_ptr<sycl::uchar> i_ptr{ input };
       sycl::device_ptr<uint32_t> mem_ptr{ mem };
       sycl::device_ptr<sycl::uchar> o_ptr{ digest };
 
-      // on-chip BRAM based allocation where input message words ( 64 -bytes )
-      // and hash state (64 -bytes ) are kept
+      // on-chip FPGA register based allocation where input message words ( 64
+      // -bytes ) and hash state (64 -bytes ) are kept
       //
-      // attempting to get stall free access to all 16 words by increasing
-      // bank count !
-      //
-      // why not use `fpga_register`, array size is relatively small ?
+      // FPGA registers are kind of abundant ( in this context ), and they allow
+      // stall-free access to each of 16 elements of these arrays --- so should
+      // yield better performance !
       [[intel::fpga_register]] uint32_t msg_0[16];
       [[intel::fpga_register]] uint32_t state_0[16];
       [[intel::fpga_register]] uint32_t msg_1[16];
       [[intel::fpga_register]] uint32_t state_1[16];
 
-      // because these are allocated on FPFGA on-chip BRAM ( private to this
-      // work-item )
-      //
-      // note, there's only one work-item
+      // just to hint that these FPGA register backed array allocations
+      // are kept on private memory ( read private to single work-item )
       sycl::private_ptr<uint32_t> state_0_ptr{ state_0 };
       sycl::private_ptr<uint32_t> msg_0_ptr{ msg_0 };
       sycl::private_ptr<uint32_t> state_1_ptr{ state_1 };
@@ -280,11 +275,14 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
       const size_t o_offset = chunk_count << 3;
 
+      // for compressing all chunks, these many compress( ... ) function
+      // calls need to be performed, because each chunk has 16 message blocks
+      // each of length 64 -bytes, making total of 1024 -bytes wide chunk
       const size_t msg_blk_cnt = chunk_count << 4;
       size_t chunk_idx = 0;
       size_t msg_blk_idx = 0;
 
-      // chunk compression section
+      // --- chunk compression section ---
       //
       // each chunk has 16 message blocks, which are compressed sequentially
       // due to input/ output chaining value dependency
@@ -295,9 +293,9 @@ hash(sycl::queue& q,                       // SYCL compute queue
       //
       // after that (i + 1)-th chunk's j-th message block is compressed and
       // resulting chaining value is written to next 32 -bytes memory on SYCL
-      // global memory
+      // global memory ( using `mem_ptr` )
       //
-      // this keep going on, untill all N -many chunk's j-th message block is
+      // this keeps going on, until all N -many chunk's j-th message blocks are
       // processed
       //
       // until now, j = 0
@@ -305,7 +303,9 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // now j = 1
       //
       // and we start by processing i-th chunk's j-th block and keep doing until
-      // all chunk's second message block is compressed
+      // all chunk's second message blocks are compressed, while using j = 0's
+      // output chaining values ( computed when j = 0 ) as input chaining values
+      // for each chunk
       //
       // finally, j = 15 i.e. last message block of each chunk
       //
@@ -391,7 +391,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
           mem_ptr[o_offset_1 + i] = state_1_ptr[i];
         }
 
-        // point to next chunk/ messae block
+        // point to next chunk/ message block
         if ((chunk_idx + 2) == chunk_count) {
           chunk_idx = 0;
           msg_blk_idx++;
@@ -399,7 +399,11 @@ hash(sycl::queue& q,                       // SYCL compute queue
           chunk_idx += 2;
         }
       }
+      //
+      // --- chunk compression ---
 
+      // --- parent chaining value computation using binary merklization ---
+      //
       // except root ( chaining values ) of BLAKE3 merkle tree, all intermediate
       // parent chaining values are to be computed in data-dependent `levels`
       // -many rounds
@@ -465,8 +469,10 @@ hash(sycl::queue& q,                       // SYCL compute queue
           }
         }
       }
+    //
+    // --- parent chaining value computation using binary merklization ---
 
-    // computing root chaining value ( BLAKE3 digest )
+    // --- computing root chaining values ( BLAKE3 digest ) ---
 #pragma unroll 16
       for (size_t j = 0; j < 16; j++) {
         msg_0_ptr[j] = mem_ptr[16 + j];
@@ -487,6 +493,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
       state_0_ptr[15] = PARENT | ROOT;
 
       compress(state_0_ptr, msg_0_ptr);
+      // --- computing root chaining values ( BLAKE3 digest ) ---
 
       // writing little endian digest bytes back to desired memory allocation
       words_to_le_bytes(state_0_ptr, o_ptr);
