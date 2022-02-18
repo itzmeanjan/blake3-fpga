@@ -1,4 +1,5 @@
 #pragma once
+#define SYCL_SIMPLE_SWIZZLES 1
 #include "common.hpp"
 #include <cassert>
 #include <sycl/ext/intel/fpga_extensions.hpp>
@@ -30,6 +31,13 @@ constexpr uint32_t CHUNK_END = 1 << 1;
 constexpr uint32_t PARENT = 1 << 2;
 constexpr uint32_t ROOT = 1 << 3;
 
+// BLAKE3 Hash State ( four 128 -bit vectors ) lane-wise rightwards rotation
+// factors
+constexpr sycl::uint4 rrot_16 = sycl::uint4(16); // = 32 - 16
+constexpr sycl::uint4 rrot_12 = sycl::uint4(20); // = 32 - 12
+constexpr sycl::uint4 rrot_8 = sycl::uint4(24);  // = 32 - 8
+constexpr sycl::uint4 rrot_7 = sycl::uint4(25);  // = 32 - 7
+
 // Binary logarithm of n, when n = 2 ^ i | i = {1, 2, 3, ...}
 const size_t
 bin_log(size_t n)
@@ -44,69 +52,51 @@ bin_log(size_t n)
   return cnt;
 }
 
-// Compile time check for circular right shift bit position x,
-// to ensure that x >= 0 && x < 32
-static constexpr bool
-is_valid_rot_pos(const uint8_t x)
-{
-  return x < 32;
-}
-
-// Circular right shift of blake3 word `n` ( 32 -bit ) by `x` bit places
-// where it's compile time checked that x >= 0 && x < 32
-template<uint8_t x>
-static inline const uint32_t
-rotr(const uint32_t n) requires(is_valid_rot_pos(x))
-{
-  return (n >> x) | (n << (32 - x));
-}
-
-// BLAKE3 mixing function, which mixes message words ( 64 -bytes ) into hash
-// state either column-wise/ diagonally
-//
-// Taken from
-// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L42-L52
-inline void
-g(sycl::private_ptr<uint32_t> state,
-  const size_t a,
-  const size_t b,
-  const size_t c,
-  const size_t d,
-  const uint32_t mx,
-  const uint32_t my)
-{
-  state[a] = state[a] + state[b] + mx;
-  state[d] = rotr<16>(state[d] ^ state[a]);
-  state[c] = state[c] + state[d];
-  state[b] = rotr<12>(state[b] ^ state[c]);
-  state[a] = state[a] + state[b] + my;
-  state[d] = rotr<8>(state[d] ^ state[a]);
-  state[c] = state[c] + state[d];
-  state[b] = rotr<7>(state[b] ^ state[c]);
-}
-
 // BLAKE3 round function, which is invoked 7 times for mixing 64 -bytes message
-// words into hash state
+// words into hash state, which is represented using four 128 -bit vectors
 //
 // During each mixing round, a permutation of 64 -bytes message words are mixed
 // into hash state both column-wise and diagonally
 //
 // Taken from
-// https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L54-L65
+// https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1569-L1621
 inline void
-round(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
+round(sycl::private_ptr<sycl::uint4> state, sycl::private_ptr<uint32_t> msg)
 {
-  // column-wise mixing of message words into hash state
-  g(state, 0, 4, 8, 12, msg[0], msg[1]);
-  g(state, 1, 5, 9, 13, msg[2], msg[3]);
-  g(state, 2, 6, 10, 14, msg[4], msg[5]);
-  g(state, 3, 7, 11, 15, msg[6], msg[7]);
+  const sycl::uint4 mx = sycl::uint4(msg[0], msg[2], msg[4], msg[6]);
+  const sycl::uint4 my = sycl::uint4(msg[1], msg[3], msg[5], msg[7]);
+  const sycl::uint4 mz = sycl::uint4(msg[8], msg[10], msg[12], msg[14]);
+  const sycl::uint4 mw = sycl::uint4(msg[9], msg[11], msg[13], msg[15]);
 
-  // diagonal mixing of message words into hash state
-  g(state, 0, 5, 10, 15, msg[8], msg[9]);
-  g(state, 1, 6, 11, 12, msg[10], msg[11]);
-  g(state, 2, 7, 8, 13, msg[12], msg[13]);
-  g(state, 3, 4, 9, 14, msg[14], msg[15]);
+  // column-wise mixing
+  state[0] = state[0] + state[1] + mx;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_16);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_12);
+  state[0] = state[0] + state[1] + my;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_8);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_7);
+
+  // diagonalize
+  state[1] = state[1].yzwx();
+  state[2] = state[2].zwxy();
+  state[3] = state[3].wxyz();
+
+  // diagonal mixing
+  state[0] = state[0] + state[1] + mz;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_16);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_12);
+  state[0] = state[0] + state[1] + mw;
+  state[3] = sycl::rotate(state[3] ^ state[0], rrot_8);
+  state[2] = state[2] + state[3];
+  state[1] = sycl::rotate(state[1] ^ state[2], rrot_7);
+
+  // un-diagonalize
+  state[1] = state[1].wxyz();
+  state[2] = state[2].zwxy();
+  state[3] = state[3].yzwx();
 }
 
 // Permute sixteen BLAKE3 message words of 64 -bytes wide block, after
@@ -140,7 +130,7 @@ permute(sycl::private_ptr<uint32_t> msg)
 // input message block ( 16 words ) into 32 -bytes output chaining value ( 8
 // words )
 void
-compress(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
+compress(sycl::private_ptr<sycl::uint4> state, sycl::private_ptr<uint32_t> msg)
 {
   // round 1
   round(state, msg);
@@ -170,16 +160,14 @@ compress(sycl::private_ptr<uint32_t> state, sycl::private_ptr<uint32_t> msg)
   round(state, msg);
 
   // prepare output chaining value of this message block compression
-#pragma unroll 8
-  for (size_t i = 0; i < 8; i++) {
-    state[i] ^= state[8 + i];
-    // note, that
-    // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
-    // can be skipped, because it doesn't affect what output chaining value will
-    // be
-    //
-    // results in lesser hardware synthesized !
-  }
+  state[0] ^= state[2];
+  state[1] ^= state[3];
+  // note, that
+  // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L118
+  // can be skipped, because it doesn't affect what output chaining value will
+  // be
+  //
+  // results in lesser hardware synthesized !
 }
 
 // Four consecutive little endian bytes are interpreted as 32 -bit unsigned
@@ -206,7 +194,7 @@ word_to_le_bytes(const uint32_t word, sycl::device_ptr<sycl::uchar> output)
 // Eight consecutive BLAKE3 message words are converted to 32 little endian
 // bytes ( used when writing BLAKE3 digest back to global memory )
 void
-words_to_le_bytes(const sycl::private_ptr<uint32_t> msg_words,
+words_to_le_bytes(const sycl::device_ptr<uint32_t> msg_words,
                   sycl::device_ptr<sycl::uchar> output)
 {
 #pragma unroll 8
@@ -262,15 +250,15 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // stall-free access to each of 16 elements of these arrays --- so should
       // yield better performance !
       [[intel::fpga_register]] uint32_t msg_0[16];
-      [[intel::fpga_register]] uint32_t state_0[16];
+      [[intel::fpga_register]] sycl::uint4 state_0[4];
       [[intel::fpga_register]] uint32_t msg_1[16];
-      [[intel::fpga_register]] uint32_t state_1[16];
+      [[intel::fpga_register]] sycl::uint4 state_1[4];
 
       // just to hint that these FPGA register backed array allocations
       // are kept on private memory ( read private to single work-item )
-      sycl::private_ptr<uint32_t> state_0_ptr{ state_0 };
+      sycl::private_ptr<sycl::uint4> state_0_ptr{ state_0 };
       sycl::private_ptr<uint32_t> msg_0_ptr{ msg_0 };
-      sycl::private_ptr<uint32_t> state_1_ptr{ state_1 };
+      sycl::private_ptr<sycl::uint4> state_1_ptr{ state_1 };
       sycl::private_ptr<uint32_t> msg_1_ptr{ msg_1 };
 
       const size_t o_offset = chunk_count << 3;
@@ -322,50 +310,76 @@ hash(sycl::queue& q,                       // SYCL compute queue
         // for first message block of each chunk, input chaining values are
         // constant initial hash values
         if (msg_blk_idx == 0) {
-#pragma unroll 8
-          for (size_t i = 0; i < 8; i++) {
-            state_0_ptr[i] = IV[i];
-            state_1_ptr[i] = IV[i];
-          }
+          state_0_ptr[0] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+          state_0_ptr[1] = sycl::uint4(IV[4], IV[5], IV[6], IV[7]);
+
+          state_1_ptr[0] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+          state_1_ptr[1] = sycl::uint4(IV[4], IV[5], IV[6], IV[7]);
         } else {
-        // for all remaining message blocks input chaining values are
-        // output chaining values obtained by compressing previous message block
-#pragma unroll 8
-          for (size_t i = 0; i < 8; i++) {
-            state_0_ptr[i] = mem_ptr[o_offset_0 + i];
-            state_1_ptr[i] = mem_ptr[o_offset_1 + i];
-          }
+          // for all remaining message blocks input chaining values are
+          // output chaining values obtained by compressing previous message
+          // block
+          state_0_ptr[0] = sycl::uint4(mem_ptr[o_offset_0 + 0],
+                                       mem_ptr[o_offset_0 + 1],
+                                       mem_ptr[o_offset_0 + 2],
+                                       mem_ptr[o_offset_0 + 3]);
+          state_0_ptr[1] = sycl::uint4(mem_ptr[o_offset_0 + 4],
+                                       mem_ptr[o_offset_0 + 5],
+                                       mem_ptr[o_offset_0 + 6],
+                                       mem_ptr[o_offset_0 + 7]);
+
+          state_1_ptr[0] = sycl::uint4(mem_ptr[o_offset_1 + 0],
+                                       mem_ptr[o_offset_1 + 1],
+                                       mem_ptr[o_offset_1 + 2],
+                                       mem_ptr[o_offset_1 + 3]);
+          state_1_ptr[1] = sycl::uint4(mem_ptr[o_offset_1 + 4],
+                                       mem_ptr[o_offset_1 + 5],
+                                       mem_ptr[o_offset_1 + 6],
+                                       mem_ptr[o_offset_1 + 7]);
         }
 
-      // prepare hash state, see
-      // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1649-L1657
-      // to understand how hash state is prepared
-      //
-      // or you may want to see non-SIMD implementation
-      // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L82-L99
-#pragma unroll 4
-        for (size_t i = 0; i < 4; i++) {
-          state_0_ptr[8 + i] = IV[i];
-          state_1_ptr[8 + i] = IV[i];
-        }
-
-        state_0_ptr[12] = static_cast<uint32_t>(chunk_idx & 0xffffffff);
-        state_0_ptr[13] = static_cast<uint32_t>(chunk_idx >> 32);
-        state_0_ptr[14] = BLOCK_LEN;
-
-        state_1_ptr[12] = static_cast<uint32_t>((chunk_idx + 1) & 0xffffffff);
-        state_1_ptr[13] = static_cast<uint32_t>((chunk_idx + 1) >> 32);
-        state_1_ptr[14] = BLOCK_LEN;
+        // prepare hash state, see
+        // https://github.com/itzmeanjan/blake3/blob/f07d32ec10cbc8a10663b7e6539e0b1dab3e453b/include/blake3.hpp#L1649-L1657
+        // to understand how hash state is prepared
+        //
+        // or you may want to see non-SIMD implementation
+        // https://github.com/BLAKE3-team/BLAKE3/blob/da4c792d8094f35c05c41c9aeb5dfe4aa67ca1ac/reference_impl/reference_impl.rs#L82-L99
+        state_0_ptr[2] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+        state_1_ptr[2] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
 
         if (msg_blk_idx == 0) {
-          state_0_ptr[15] = CHUNK_START;
-          state_1_ptr[15] = CHUNK_START;
+          state_0_ptr[3] =
+            sycl::uint4(static_cast<uint32_t>(chunk_idx & 0xffffffff),
+                        static_cast<uint32_t>(chunk_idx >> 32),
+                        BLOCK_LEN,
+                        CHUNK_START);
+          state_1_ptr[3] =
+            sycl::uint4(static_cast<uint32_t>((chunk_idx + 1) & 0xffffffff),
+                        static_cast<uint32_t>((chunk_idx + 1) >> 32),
+                        BLOCK_LEN,
+                        CHUNK_START);
         } else if (msg_blk_idx == 15) {
-          state_0_ptr[15] = CHUNK_END;
-          state_1_ptr[15] = CHUNK_END;
+          state_0_ptr[3] =
+            sycl::uint4(static_cast<uint32_t>(chunk_idx & 0xffffffff),
+                        static_cast<uint32_t>(chunk_idx >> 32),
+                        BLOCK_LEN,
+                        CHUNK_END);
+          state_1_ptr[3] =
+            sycl::uint4(static_cast<uint32_t>((chunk_idx + 1) & 0xffffffff),
+                        static_cast<uint32_t>((chunk_idx + 1) >> 32),
+                        BLOCK_LEN,
+                        CHUNK_END);
         } else {
-          state_0_ptr[15] = 0;
-          state_1_ptr[15] = 0;
+          state_0_ptr[3] =
+            sycl::uint4(static_cast<uint32_t>(chunk_idx & 0xffffffff),
+                        static_cast<uint32_t>(chunk_idx >> 32),
+                        BLOCK_LEN,
+                        0);
+          state_1_ptr[3] =
+            sycl::uint4(static_cast<uint32_t>((chunk_idx + 1) & 0xffffffff),
+                        static_cast<uint32_t>((chunk_idx + 1) >> 32),
+                        BLOCK_LEN,
+                        0);
         }
 
       // 64 -bytes message block read from global memory ( expensive, but
@@ -385,10 +399,17 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
       // obtain 32 -bytes output chaining values, and write back to global
       // memory ( expensive, can attempt to avoid this ! )
-#pragma unroll 8
-        for (size_t i = 0; i < 8; i++) {
-          mem_ptr[o_offset_0 + i] = state_0_ptr[i];
-          mem_ptr[o_offset_1 + i] = state_1_ptr[i];
+#pragma unroll 2
+        for (size_t i = 0; i < 2; i++) {
+          mem_ptr[o_offset_0 + (i << 2) + 0] = state_0_ptr[i].x();
+          mem_ptr[o_offset_0 + (i << 2) + 1] = state_0_ptr[i].y();
+          mem_ptr[o_offset_0 + (i << 2) + 2] = state_0_ptr[i].z();
+          mem_ptr[o_offset_0 + (i << 2) + 3] = state_0_ptr[i].w();
+
+          mem_ptr[o_offset_1 + (i << 2) + 0] = state_1_ptr[i].x();
+          mem_ptr[o_offset_1 + (i << 2) + 1] = state_1_ptr[i].y();
+          mem_ptr[o_offset_1 + (i << 2) + 2] = state_1_ptr[i].z();
+          mem_ptr[o_offset_1 + (i << 2) + 3] = state_1_ptr[i].w();
         }
 
         // point to next chunk/ message block
@@ -435,68 +456,73 @@ hash(sycl::queue& q,                       // SYCL compute queue
             msg_1_ptr[j] = mem_ptr[i_offset_1 + j];
           }
 
-        // input chaining values being placed in first 8 words of hash state
-#pragma unroll 8
-          for (size_t i = 0; i < 8; i++) {
-            state_0_ptr[i] = IV[i];
-            state_1_ptr[i] = IV[i];
-          }
-#pragma unroll 4
-          for (size_t i = 0; i < 4; i++) {
-            state_0_ptr[8 + i] = IV[i];
-            state_1_ptr[8 + i] = IV[i];
-          }
+          // input chaining values being placed in first 8 words of hash state
+          state_0_ptr[0] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+          state_0_ptr[1] = sycl::uint4(IV[4], IV[5], IV[6], IV[7]);
+          state_0_ptr[2] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+          state_0_ptr[3] = sycl::uint4(0, 0, BLOCK_LEN, PARENT);
 
-          state_0_ptr[12] = 0;
-          state_0_ptr[13] = 0;
-          state_0_ptr[14] = BLOCK_LEN;
-          state_0_ptr[15] = PARENT;
-
-          state_1_ptr[12] = 0;
-          state_1_ptr[13] = 0;
-          state_1_ptr[14] = BLOCK_LEN;
-          state_1_ptr[15] = PARENT;
+          state_1_ptr[0] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+          state_1_ptr[1] = sycl::uint4(IV[4], IV[5], IV[6], IV[7]);
+          state_1_ptr[2] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+          state_1_ptr[3] = sycl::uint4(0, 0, BLOCK_LEN, PARENT);
 
           // compressing this message block
           compress(state_0_ptr, msg_0_ptr);
           compress(state_1_ptr, msg_1_ptr);
 
-        // producing parent chaining value
-#pragma unroll 8
-          for (size_t j = 0; j < 8; j++) {
-            mem_ptr[o_offset_0 + j] = state_0_ptr[j];
-            mem_ptr[o_offset_1 + j] = state_1_ptr[j];
-          }
+          // producing parent chaining value
+          mem_ptr[o_offset_0 + 0] = state_0_ptr[0].x();
+          mem_ptr[o_offset_0 + 1] = state_0_ptr[0].y();
+          mem_ptr[o_offset_0 + 2] = state_0_ptr[0].z();
+          mem_ptr[o_offset_0 + 3] = state_0_ptr[0].w();
+          mem_ptr[o_offset_0 + 4] = state_0_ptr[1].x();
+          mem_ptr[o_offset_0 + 5] = state_0_ptr[1].y();
+          mem_ptr[o_offset_0 + 6] = state_0_ptr[1].z();
+          mem_ptr[o_offset_0 + 7] = state_0_ptr[1].w();
+
+          mem_ptr[o_offset_1 + 0] = state_1_ptr[0].x();
+          mem_ptr[o_offset_1 + 1] = state_1_ptr[0].y();
+          mem_ptr[o_offset_1 + 2] = state_1_ptr[0].z();
+          mem_ptr[o_offset_1 + 3] = state_1_ptr[0].w();
+          mem_ptr[o_offset_1 + 4] = state_1_ptr[1].x();
+          mem_ptr[o_offset_1 + 5] = state_1_ptr[1].y();
+          mem_ptr[o_offset_1 + 6] = state_1_ptr[1].z();
+          mem_ptr[o_offset_1 + 7] = state_1_ptr[1].w();
         }
       }
     //
     // --- parent chaining value computation using binary merklization ---
 
     // --- computing root chaining values ( BLAKE3 digest ) ---
+    //
+    // prepare input message words
 #pragma unroll 16
-      for (size_t j = 0; j < 16; j++) {
-        msg_0_ptr[j] = mem_ptr[16 + j];
+      for (size_t i = 0; i < 16; i++) {
+        msg_0_ptr[i] = mem_ptr[16 + i];
       }
 
-#pragma unroll 8
-      for (size_t i = 0; i < 8; i++) {
-        state_0_ptr[i] = IV[i];
-      }
-#pragma unroll 4
-      for (size_t i = 0; i < 4; i++) {
-        state_0_ptr[8 + i] = IV[i];
-      }
+      // prepare hash state
+      state_0_ptr[0] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+      state_0_ptr[1] = sycl::uint4(IV[4], IV[5], IV[6], IV[7]);
+      state_0_ptr[2] = sycl::uint4(IV[0], IV[1], IV[2], IV[3]);
+      state_0_ptr[3] = sycl::uint4(0, 0, BLOCK_LEN, PARENT | ROOT);
 
-      state_0_ptr[12] = 0;
-      state_0_ptr[13] = 0;
-      state_0_ptr[14] = BLOCK_LEN;
-      state_0_ptr[15] = PARENT | ROOT;
-
+      // compress and find root of blake3 merkle tree
       compress(state_0_ptr, msg_0_ptr);
+
+    // write output chaining values back to global memory
+#pragma unroll 2
+      for (size_t i = 0; i < 2; i++) {
+        mem_ptr[8 + (i << 2) + 0] = state_0_ptr[i].x();
+        mem_ptr[8 + (i << 2) + 1] = state_0_ptr[i].y();
+        mem_ptr[8 + (i << 2) + 2] = state_0_ptr[i].z();
+        mem_ptr[8 + (i << 2) + 3] = state_0_ptr[i].w();
+      }
       // --- computing root chaining values ( BLAKE3 digest ) ---
 
       // writing little endian digest bytes back to desired memory allocation
-      words_to_le_bytes(state_0_ptr, o_ptr);
+      words_to_le_bytes(mem_ptr + 8, o_ptr);
     });
 
   evt.wait();
