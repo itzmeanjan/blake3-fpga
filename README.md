@@ -195,25 +195,25 @@ running on pac_a10 : Intel PAC Platform (pac_ee00000)
 
 Benchmarking BLAKE3 FPGA implementation
 
-              input size		  execution time		host-to-device tx time		device-to-host tx time
-                   1 MB		           1.127820 ms		         399.874625 us		          88.873000 us
-                   2 MB		           2.205309 ms		         669.153625 us		          84.875875 us
-                   4 MB		           4.353167 ms		           1.004857 ms		          85.069125 us
-                   8 MB		           8.643984 ms		           1.633951 ms		          76.423375 us
-                  16 MB		          17.219312 ms		           2.997660 ms		          79.418125 us
-                  32 MB		          34.367224 ms		           6.250827 ms		          85.557125 us
-                  64 MB		          68.657510 ms		          12.520800 ms		          85.347125 us
-                 128 MB		         137.233338 ms		          23.457125 ms		          89.994000 us
-                 256 MB		         274.380422 ms		          43.577968 ms		          87.475000 us
-                 512 MB		         548.669188 ms		          84.584534 ms		          86.068250 us
-                1024 MB		            1.097243 s		         167.424993 ms		          83.313750 us
+              input size                  execution time                host-to-device tx time          device-to-host tx time
+                   1 MB                  138.487375 us                   421.993125 us                    61.492625 us
+                   2 MB                  259.962875 us                   696.308000 us                    85.265375 us
+                   4 MB                  496.056500 us                     1.091515 ms                    84.755625 us
+                   8 MB                  985.286625 us                     1.674159 ms                    82.991875 us
+                  16 MB                    1.941844 ms                     3.048934 ms                    63.686000 us
+                  32 MB                    3.848572 ms                     6.395413 ms                    71.175375 us
+                  64 MB                    7.703389 ms                    12.999837 ms                    82.688000 us
+                 128 MB                   15.282095 ms                    23.696630 ms                    87.255250 us
+                 256 MB                   31.177414 ms                    44.916047 ms                    84.804875 us
+                 512 MB                   61.033350 ms                    86.641925 ms                    98.026375 us
+                1024 MB                  122.169668 ms                   170.085517 ms                    90.151250 us
 ```
 
-Note, this design can benefit from replicating data path which compresses message blocks, but that comes with increased resource consumption. This (simple + straight-forward) baseline design, which interacts with global memory quite often, slows down due to high global memory access latecy.
+Note, this design can benefit from replicating data path which compresses message blocks many more number of times ( currently replication factor set to 1 ), but that comes with increased resource consumption. This primary design, which interacts with global memory quite often, slows down due to high global memory access latency.
 
-Future efforts that can be put in improving this design is reducing interaction with global memory system and increasing usage of on-chip BRAM, while synthesizing more ( power of 2 -many ) replicas of BLAKE3 `compress( ... )` function, at cost of higher resource usage.
+Future efforts that can be put in improving this design is reducing interaction with global memory system and increasing usage of on-chip ( stall-free ) BRAM for double bufferring purposes, while synthesizing more ( power of 2 -many ) replicas of BLAKE3 `compress( ... )` function, at cost of higher resource usage.
 
-> I've also experimented with SYCL pipe based design pattern ( in BLAKE3 context ) where producer ( read orchestrator ) <-> consumer ( read compressor ) pattern is utilized, reducing global memory access; but it turns out that due to hierarchical data dependency in BLAKE3 binary merkle tree, that pattern doesn't yield much useful results and pipe ends up slowing down due to stalling in both sides.
+> I've also experimented with SYCL pipe based design pattern ( in BLAKE3 context ) where producer ( read orchestrator ) <-> consumer ( read compressor ) pattern is utilized, reducing global memory access; but it turns out that due to hierarchical data dependency in BLAKE3 binary merkle tree, that pattern doesn't yield much useful results and pipe ends up slowing down due to stalling on both ends.
 
 **👇 are taken from final report generated after FPGA h/w synthesis, targeting Intel Arria 10 board**
 
