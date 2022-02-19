@@ -196,20 +196,20 @@ running on pac_a10 : Intel PAC Platform (pac_ee00000)
 Benchmarking BLAKE3 FPGA implementation
 
               input size                  execution time                host-to-device tx time          device-to-host tx time
-                   1 MB                  138.668875 us                   342.348125 us                    81.991625 us
-                   2 MB                  257.963375 us                   594.499625 us                    60.931750 us
-                   4 MB                  499.991375 us                   922.121750 us                    77.566750 us
-                   8 MB                  985.338250 us                     1.562302 ms                    76.989375 us
-                  16 MB                    1.961749 ms                     2.921717 ms                    76.725375 us
-                  32 MB                    3.918744 ms                     6.239170 ms                    78.779250 us
-                  64 MB                    7.818283 ms                    12.604511 ms                    87.071000 us
-                 128 MB                   15.637260 ms                    23.531873 ms                    80.121250 us
-                 256 MB                   31.254826 ms                    43.690892 ms                    75.809000 us
-                 512 MB                   62.450432 ms                    84.990691 ms                    80.160750 us
-                1024 MB                  124.960085 ms                   167.462934 ms                    89.227750 us
+                   1 MB                  138.487375 us                   421.993125 us                    61.492625 us
+                   2 MB                  259.962875 us                   696.308000 us                    85.265375 us
+                   4 MB                  496.056500 us                     1.091515 ms                    84.755625 us
+                   8 MB                  985.286625 us                     1.674159 ms                    82.991875 us
+                  16 MB                    1.941844 ms                     3.048934 ms                    63.686000 us
+                  32 MB                    3.848572 ms                     6.395413 ms                    71.175375 us
+                  64 MB                    7.703389 ms                    12.999837 ms                    82.688000 us
+                 128 MB                   15.282095 ms                    23.696630 ms                    87.255250 us
+                 256 MB                   31.177414 ms                    44.916047 ms                    84.804875 us
+                 512 MB                   61.033350 ms                    86.641925 ms                    98.026375 us
+                1024 MB                  122.169668 ms                   170.085517 ms                    90.151250 us
 ```
 
-Note, this design can benefit from replicating data path which compresses message blocks many more number of times ( currently replication factor set to 2 ), but that comes with increased resource consumption. This primary design, which interacts with global memory quite often, slows down due to high global memory access latecy.
+Note, this design can benefit from replicating data path which compresses message blocks many more number of times ( currently replication factor set to 1 ), but that comes with increased resource consumption. This primary design, which interacts with global memory quite often, slows down due to high global memory access latency.
 
 Future efforts that can be put in improving this design is reducing interaction with global memory system and increasing usage of on-chip ( stall-free ) BRAM for double bufferring purposes, while synthesizing more ( power of 2 -many ) replicas of BLAKE3 `compress( ... )` function, at cost of higher resource usage.
 

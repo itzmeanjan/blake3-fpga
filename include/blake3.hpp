@@ -241,8 +241,8 @@ hash(sycl::queue& q,                       // SYCL compute queue
   // temporary memory allocation on global memory for keeping all intermediate
   // chaining values
   //
-  // note, chaining values are organized as nodes are kept in computed ( all
-  // intermediate nodes ) binary merkle tree
+  // note, chaining values are organized as nodes are kept in fully computed (
+  // all intermediate nodes, along with leaves ) binary merkle tree
   //
   // @todo this allocation size can be improved !
   const size_t mem_size = (chunk_count * OUT_LEN) << 1;
@@ -419,7 +419,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
           msg_3_ptr[i] = word_from_le_bytes(i_ptr + i_offset_3 + (i << 2));
         }
 
-        // compress these message block(s)
+        // compress four message block(s) from four consecutive chunks
         compress(state_0_ptr, msg_0_ptr);
         compress(state_1_ptr, msg_1_ptr);
         compress(state_2_ptr, msg_2_ptr);
@@ -501,11 +501,11 @@ hash(sycl::queue& q,                       // SYCL compute queue
           state_1_ptr[14] = BLOCK_LEN;
           state_1_ptr[15] = PARENT;
 
-          // compressing this message block
+          // compressing two message blocks, living next to each other
           compress(state_0_ptr, msg_0_ptr);
           compress(state_1_ptr, msg_1_ptr);
 
-        // producing parent chaining value
+        // producing parent chaining values
 #pragma unroll 8
           for (size_t j = 0; j < 8; j++) {
             mem_ptr[o_offset_0 + j] = state_0_ptr[j];
