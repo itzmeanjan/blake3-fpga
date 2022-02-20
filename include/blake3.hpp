@@ -264,11 +264,15 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // yield better performance !
       [[intel::fpga_register]] uint32_t msg_0[16];
       [[intel::fpga_register]] uint32_t state_0[16];
+      [[intel::fpga_register]] uint32_t msg_1[16];
+      [[intel::fpga_register]] uint32_t state_1[16];
 
       // just to hint that these FPGA register backed array allocations
       // are kept on private memory ( read private to single work-item )
       sycl::private_ptr<uint32_t> msg_0_ptr{ msg_0 };
       sycl::private_ptr<uint32_t> state_0_ptr{ state_0 };
+      sycl::private_ptr<uint32_t> msg_1_ptr{ msg_1 };
+      sycl::private_ptr<uint32_t> state_1_ptr{ state_1 };
 
       const size_t o_offset = chunk_count << 3;
 
@@ -310,10 +314,12 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // for j = 15, all chunk's message blocks are compressed and it produces N
       // -many output chaining values for N -many chunks, which were compressed
       // in 16 consecutive rounds
-      [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c++)
+      [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c += 2)
       {
         const size_t i_offset_0 = (chunk_idx << 10) + (msg_blk_idx << 4);
+        const size_t i_offset_1 = ((chunk_idx + 1) << 10) + (msg_blk_idx << 4);
         const size_t o_offset_0 = o_offset + (chunk_idx << 3);
+        const size_t o_offset_1 = o_offset + ((chunk_idx + 1) << 3);
 
         // for first message block of each chunk, input chaining values are
         // constant initial hash values
@@ -321,6 +327,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_0_ptr[i] = IV[i];
+            state_1_ptr[i] = IV[i];
           }
         } else {
         // for all remaining message blocks input chaining values are
@@ -328,6 +335,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_0_ptr[i] = mem_ptr[o_offset_0 + i];
+            state_1_ptr[i] = mem_ptr[o_offset_1 + i];
           }
         }
 
@@ -340,18 +348,26 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 4
         for (size_t i = 0; i < 4; i++) {
           state_0_ptr[8 + i] = IV[i];
+          state_1_ptr[8 + i] = IV[i];
         }
 
         state_0_ptr[12] = static_cast<uint32_t>(chunk_idx & 0xffffffff);
         state_0_ptr[13] = static_cast<uint32_t>(chunk_idx >> 32);
         state_0_ptr[14] = BLOCK_LEN;
 
+        state_1_ptr[12] = static_cast<uint32_t>((chunk_idx + 1) & 0xffffffff);
+        state_1_ptr[13] = static_cast<uint32_t>((chunk_idx + 1) >> 32);
+        state_1_ptr[14] = BLOCK_LEN;
+
         if (msg_blk_idx == 0) {
           state_0_ptr[15] = CHUNK_START;
+          state_1_ptr[15] = CHUNK_START;
         } else if (msg_blk_idx == 15) {
           state_0_ptr[15] = CHUNK_END;
+          state_1_ptr[15] = CHUNK_END;
         } else {
           state_0_ptr[15] = 0;
+          state_1_ptr[15] = 0;
         }
 
       // 64 -bytes message block read from global memory ( expensive, but
@@ -359,24 +375,27 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 16
         for (size_t i = 0; i < 16; i++) {
           msg_0_ptr[i] = word_from_le_bytes(i_ptr + i_offset_0 + (i << 2));
+          msg_1_ptr[i] = word_from_le_bytes(i_ptr + i_offset_1 + (i << 2));
         }
 
         // compress four message block(s) from four consecutive chunks
         compress(state_0_ptr, msg_0_ptr);
+        compress(state_1_ptr, msg_1_ptr);
 
       // obtain 32 -bytes output chaining values, and write back to global
       // memory ( expensive, can attempt to avoid this ! )
 #pragma unroll 8
         for (size_t i = 0; i < 8; i++) {
           mem_ptr[o_offset_0 + i] = state_0_ptr[i];
+          mem_ptr[o_offset_1 + i] = state_1_ptr[i];
         }
 
         // point to next chunk/ message block
-        if ((chunk_idx + 1) == workable_chunk_cnt) {
+        if ((chunk_idx + 2) == workable_chunk_cnt) {
           chunk_idx = 0;
           msg_blk_idx++;
         } else {
-          chunk_idx++;
+          chunk_idx += 2;
         }
       }
       //
@@ -387,7 +406,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // except root ( chaining values ) of BLAKE3 merkle tree, all intermediate
       // parent chaining values are to be computed in data-dependent `levels`
       // -many rounds
-      const size_t levels = bin_log(workable_chunk_cnt);
+      const size_t levels = bin_log(workable_chunk_cnt) - 1;
 
       // level (i + 1) consumes level i as input ( where leaf nodes are already
       // computed, see above chunk compression section )
@@ -398,25 +417,30 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
         // these many intermediate chaining values are to be computed in this
         // level of BLAKE3 binary merkle tree
-        [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i++)
+        [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i += 2)
         {
           const size_t i_offset_0 = i_offset + (i << 4);
+          const size_t i_offset_1 = i_offset + ((i + 1) << 4);
           const size_t o_offset_0 = o_offset + (i << 3);
+          const size_t o_offset_1 = o_offset + ((i + 1) << 3);
 
         // read 64 -bytes message words from global memory
 #pragma unroll 16
           for (size_t j = 0; j < 16; j++) {
             msg_0_ptr[j] = mem_ptr[i_offset_0 + j];
+            msg_1_ptr[j] = mem_ptr[i_offset_1 + j];
           }
 
         // input chaining values being placed in first 8 words of hash state
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_0_ptr[i] = IV[i];
+            state_1_ptr[i] = IV[i];
           }
 #pragma unroll 4
           for (size_t i = 0; i < 4; i++) {
             state_0_ptr[8 + i] = IV[i];
+            state_1_ptr[8 + i] = IV[i];
           }
 
           state_0_ptr[12] = 0;
@@ -424,15 +448,48 @@ hash(sycl::queue& q,                       // SYCL compute queue
           state_0_ptr[14] = BLOCK_LEN;
           state_0_ptr[15] = PARENT;
 
+          state_1_ptr[12] = 0;
+          state_1_ptr[13] = 0;
+          state_1_ptr[14] = BLOCK_LEN;
+          state_1_ptr[15] = PARENT;
+
           // compressing two message blocks, living next to each other
           compress(state_0_ptr, msg_0_ptr);
+          compress(state_1_ptr, msg_1_ptr);
 
         // producing parent chaining values
 #pragma unroll 8
           for (size_t j = 0; j < 8; j++) {
             mem_ptr[o_offset_0 + j] = state_0_ptr[j];
+            mem_ptr[o_offset_1 + j] = state_1_ptr[j];
           }
         }
+      }
+
+#pragma unroll 16
+      for (size_t j = 0; j < 16; j++) {
+        msg_0_ptr[j] = mem_ptr[32 + j];
+      }
+
+#pragma unroll 8
+      for (size_t i = 0; i < 8; i++) {
+        state_0_ptr[i] = IV[i];
+      }
+#pragma unroll 4
+      for (size_t i = 0; i < 4; i++) {
+        state_0_ptr[8 + i] = IV[i];
+      }
+
+      state_0_ptr[12] = 0;
+      state_0_ptr[13] = 0;
+      state_0_ptr[14] = BLOCK_LEN;
+      state_0_ptr[15] = PARENT;
+
+      compress(state_0_ptr, msg_0_ptr);
+
+#pragma unroll 8
+      for (size_t j = 0; j < 8; j++) {
+        mem_ptr[16 + j] = state_0_ptr[j];
       }
       //
       // --- parent chaining value computation using binary merklization ---
@@ -452,11 +509,15 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // yield better performance !
       [[intel::fpga_register]] uint32_t msg_0[16];
       [[intel::fpga_register]] uint32_t state_0[16];
+      [[intel::fpga_register]] uint32_t msg_1[16];
+      [[intel::fpga_register]] uint32_t state_1[16];
 
       // just to hint that these FPGA register backed array allocations
       // are kept on private memory ( read private to single work-item )
       sycl::private_ptr<uint32_t> msg_0_ptr{ msg_0 };
       sycl::private_ptr<uint32_t> state_0_ptr{ state_0 };
+      sycl::private_ptr<uint32_t> msg_1_ptr{ msg_1 };
+      sycl::private_ptr<uint32_t> state_1_ptr{ state_1 };
 
       const size_t o_offset = chunk_count << 3;
 
@@ -498,10 +559,12 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // for j = 15, all chunk's message blocks are compressed and it produces N
       // -many output chaining values for N -many chunks, which were compressed
       // in 16 consecutive rounds
-      [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c++)
+      [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c += 2)
       {
         const size_t i_offset_0 = (chunk_idx << 10) + (msg_blk_idx << 4);
+        const size_t i_offset_1 = ((chunk_idx + 1) << 10) + (msg_blk_idx << 4);
         const size_t o_offset_0 = o_offset + (chunk_idx << 3);
+        const size_t o_offset_1 = o_offset + ((chunk_idx + 1) << 3);
 
         // for first message block of each chunk, input chaining values are
         // constant initial hash values
@@ -509,6 +572,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_0_ptr[i] = IV[i];
+            state_1_ptr[i] = IV[i];
           }
         } else {
         // for all remaining message blocks input chaining values are
@@ -516,6 +580,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_0_ptr[i] = mem_ptr[o_offset_0 + i];
+            state_1_ptr[i] = mem_ptr[o_offset_1 + i];
           }
         }
 
@@ -528,18 +593,26 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 4
         for (size_t i = 0; i < 4; i++) {
           state_0_ptr[8 + i] = IV[i];
+          state_1_ptr[8 + i] = IV[i];
         }
 
         state_0_ptr[12] = static_cast<uint32_t>(chunk_idx & 0xffffffff);
         state_0_ptr[13] = static_cast<uint32_t>(chunk_idx >> 32);
         state_0_ptr[14] = BLOCK_LEN;
 
+        state_1_ptr[12] = static_cast<uint32_t>((chunk_idx + 1) & 0xffffffff);
+        state_1_ptr[13] = static_cast<uint32_t>((chunk_idx + 1) >> 32);
+        state_1_ptr[14] = BLOCK_LEN;
+
         if (msg_blk_idx == 0) {
           state_0_ptr[15] = CHUNK_START;
+          state_1_ptr[15] = CHUNK_START;
         } else if (msg_blk_idx == 15) {
           state_0_ptr[15] = CHUNK_END;
+          state_1_ptr[15] = CHUNK_END;
         } else {
           state_0_ptr[15] = 0;
+          state_1_ptr[15] = 0;
         }
 
       // 64 -bytes message block read from global memory ( expensive, but
@@ -547,24 +620,27 @@ hash(sycl::queue& q,                       // SYCL compute queue
 #pragma unroll 16
         for (size_t i = 0; i < 16; i++) {
           msg_0_ptr[i] = word_from_le_bytes(i_ptr + i_offset_0 + (i << 2));
+          msg_1_ptr[i] = word_from_le_bytes(i_ptr + i_offset_1 + (i << 2));
         }
 
         // compress four message block(s) from four consecutive chunks
         compress(state_0_ptr, msg_0_ptr);
+        compress(state_1_ptr, msg_1_ptr);
 
       // obtain 32 -bytes output chaining values, and write back to global
       // memory ( expensive, can attempt to avoid this ! )
 #pragma unroll 8
         for (size_t i = 0; i < 8; i++) {
           mem_ptr[o_offset_0 + i] = state_0_ptr[i];
+          mem_ptr[o_offset_1 + i] = state_1_ptr[i];
         }
 
         // point to next chunk/ message block
-        if ((chunk_idx + 1) == chunk_count) {
+        if ((chunk_idx + 2) == chunk_count) {
           chunk_idx = workable_chunk_cnt;
           msg_blk_idx++;
         } else {
-          chunk_idx++;
+          chunk_idx += 2;
         }
       }
       //
@@ -575,7 +651,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
       // except root ( chaining values ) of BLAKE3 merkle tree, all intermediate
       // parent chaining values are to be computed in data-dependent `levels`
       // -many rounds
-      const size_t levels = bin_log(workable_chunk_cnt);
+      const size_t levels = bin_log(workable_chunk_cnt) - 1;
 
       // level (i + 1) consumes level i as input ( where leaf nodes are already
       // computed, see above chunk compression section )
@@ -586,25 +662,30 @@ hash(sycl::queue& q,                       // SYCL compute queue
 
         // these many intermediate chaining values are to be computed in this
         // level of BLAKE3 binary merkle tree
-        [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i++)
+        [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i += 2)
         {
           const size_t i_offset_0 = i_offset + (i << 4);
+          const size_t i_offset_1 = i_offset + ((i + 1) << 4);
           const size_t o_offset_0 = o_offset + (i << 3);
+          const size_t o_offset_1 = o_offset + ((i + 1) << 3);
 
         // read 64 -bytes message words from global memory
 #pragma unroll 16
           for (size_t j = 0; j < 16; j++) {
             msg_0_ptr[j] = mem_ptr[i_offset_0 + j];
+            msg_1_ptr[j] = mem_ptr[i_offset_1 + j];
           }
 
         // input chaining values being placed in first 8 words of hash state
 #pragma unroll 8
           for (size_t i = 0; i < 8; i++) {
             state_0_ptr[i] = IV[i];
+            state_1_ptr[i] = IV[i];
           }
 #pragma unroll 4
           for (size_t i = 0; i < 4; i++) {
             state_0_ptr[8 + i] = IV[i];
+            state_1_ptr[8 + i] = IV[i];
           }
 
           state_0_ptr[12] = 0;
@@ -612,15 +693,48 @@ hash(sycl::queue& q,                       // SYCL compute queue
           state_0_ptr[14] = BLOCK_LEN;
           state_0_ptr[15] = PARENT;
 
+          state_1_ptr[12] = 0;
+          state_1_ptr[13] = 0;
+          state_1_ptr[14] = BLOCK_LEN;
+          state_1_ptr[15] = PARENT;
+
           // compressing two message blocks, living next to each other
           compress(state_0_ptr, msg_0_ptr);
+          compress(state_1_ptr, msg_1_ptr);
 
         // producing parent chaining values
 #pragma unroll 8
           for (size_t j = 0; j < 8; j++) {
             mem_ptr[o_offset_0 + j] = state_0_ptr[j];
+            mem_ptr[o_offset_1 + j] = state_1_ptr[j];
           }
         }
+      }
+
+#pragma unroll 16
+      for (size_t j = 0; j < 16; j++) {
+        msg_0_ptr[j] = mem_ptr[48 + j];
+      }
+
+#pragma unroll 8
+      for (size_t i = 0; i < 8; i++) {
+        state_0_ptr[i] = IV[i];
+      }
+#pragma unroll 4
+      for (size_t i = 0; i < 4; i++) {
+        state_0_ptr[8 + i] = IV[i];
+      }
+
+      state_0_ptr[12] = 0;
+      state_0_ptr[13] = 0;
+      state_0_ptr[14] = BLOCK_LEN;
+      state_0_ptr[15] = PARENT;
+
+      compress(state_0_ptr, msg_0_ptr);
+
+#pragma unroll 8
+      for (size_t j = 0; j < 8; j++) {
+        mem_ptr[24 + j] = state_0_ptr[j];
       }
       //
       // --- parent chaining value computation using binary merklization ---
@@ -679,7 +793,7 @@ hash(sycl::queue& q,                       // SYCL compute queue
   sycl::free(mem, q);
 
   if (ts != nullptr) {
-    *ts = ((time_event(evt0) + time_event(evt1)) / 2) + time_event(evt2);
+    *ts = std::max(time_event(evt0), time_event(evt1)) + time_event(evt2);
   }
 }
 }
