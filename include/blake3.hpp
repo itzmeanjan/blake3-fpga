@@ -278,36 +278,37 @@ hash(sycl::queue& q,                       // SYCL compute queue
       size_t chunk_idx = 0;
       size_t msg_blk_idx = 0;
 
-      // --- chunk compression section ---
-      //
-      // each chunk has 16 message blocks, which are compressed sequentially
-      // due to input/ output chaining value dependency
-      //
-      // in following for loop i-th chunk's j-th message block is compressed
-      // first, resulting chaining value is written back to global memory (
-      // expensive op ! )
-      //
-      // after that (i + 1)-th chunk's j-th message block is compressed and
-      // resulting chaining value is written to next 32 -bytes memory on SYCL
-      // global memory ( using `mem_ptr` )
-      //
-      // this keeps going on, until all N -many chunk's j-th message blocks are
-      // processed
-      //
-      // until now, j = 0
-      //
-      // now j = 1
-      //
-      // and we start by processing i-th chunk's j-th block and keep doing until
-      // all chunk's second message blocks are compressed, while using j = 0's
-      // output chaining values ( computed when j = 0 ) as input chaining values
-      // for each chunk
-      //
-      // finally, j = 15 i.e. last message block of each chunk
-      //
-      // for j = 15, all chunk's message blocks are compressed and it produces N
-      // -many output chaining values for N -many chunks, which were compressed
-      // in 16 consecutive rounds
+    // --- chunk compression section ---
+    //
+    // each chunk has 16 message blocks, which are compressed sequentially
+    // due to input/ output chaining value dependency
+    //
+    // in following for loop i-th chunk's j-th message block is compressed
+    // first, resulting chaining value is written back to global memory (
+    // expensive op ! )
+    //
+    // after that (i + 1)-th chunk's j-th message block is compressed and
+    // resulting chaining value is written to next 32 -bytes memory on SYCL
+    // global memory ( using `mem_ptr` )
+    //
+    // this keeps going on, until all N -many chunk's j-th message blocks are
+    // processed
+    //
+    // until now, j = 0
+    //
+    // now j = 1
+    //
+    // and we start by processing i-th chunk's j-th block and keep doing until
+    // all chunk's second message blocks are compressed, while using j = 0's
+    // output chaining values ( computed when j = 0 ) as input chaining values
+    // for each chunk
+    //
+    // finally, j = 15 i.e. last message block of each chunk
+    //
+    // for j = 15, all chunk's message blocks are compressed and it produces N
+    // -many output chaining values for N -many chunks, which were compressed
+    // in 16 consecutive rounds
+#pragma unroll 2
       [[intel::ivdep]] for (size_t c = 0; c < msg_blk_cnt; c++)
       {
         const size_t i_offset_0 = (chunk_idx << 10) + (msg_blk_idx << 4);
@@ -394,8 +395,9 @@ hash(sycl::queue& q,                       // SYCL compute queue
         const size_t o_offset = i_offset >> 1;
         const size_t node_cnt = chunk_count >> (l + 1);
 
-        // these many intermediate chaining values are to be computed in this
-        // level of BLAKE3 binary merkle tree
+      // these many intermediate chaining values are to be computed in this
+      // level of BLAKE3 binary merkle tree
+#pragma unroll 2
         [[intel::ivdep]] for (size_t i = 0; i < node_cnt; i++)
         {
           const size_t i_offset_0 = i_offset + (i << 4);
